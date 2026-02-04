@@ -170,6 +170,20 @@ stop_animation() {
 TOTAL_SCORE=0
 MAX_SCORE=0
 declare -a CHECK_RESULTS=()
+declare -a SKIPPED_SUDO=()
+
+# Check if we have root/sudo access
+is_root() {
+    [[ $EUID -eq 0 ]]
+}
+
+can_read_shadow() {
+    [[ -r /etc/shadow ]]
+}
+
+can_read_sudoers() {
+    [[ -r /etc/sudoers ]]
+}
 
 add_score() {
     local points="$1"
@@ -537,8 +551,14 @@ check_guest_disabled() {
 run_user_checks() {
     local category="USER SECURITY"
 
-    run_check "$category" "User has password" 50 "check_user_has_password" || true
-    run_check "$category" "No empty passwords" 75 "check_no_empty_passwords" || true
+    if can_read_shadow || is_root; then
+        run_check "$category" "User has password" 50 "check_user_has_password" || true
+        run_check "$category" "No empty passwords" 75 "check_no_empty_passwords" || true
+    else
+        skip_check "$category" "User has password" "needs sudo"
+        skip_check "$category" "No empty passwords" "needs sudo"
+        SKIPPED_SUDO+=("User password checks (/etc/shadow)")
+    fi
     run_check "$category" "Sudo requires password" 50 "check_sudo_requires_password" || true
     run_check "$category" "Screen lock enabled" 50 "check_screen_lock" || true
     run_check "$category" "Guest account disabled" 25 "check_guest_disabled" || true
@@ -1248,7 +1268,17 @@ print_findings() {
         done
     fi
 
-    if [[ "$has_findings" == "true" ]]; then
+    # Skipped checks that need sudo
+    if [[ ${#SKIPPED_SUDO[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${YELLOW}${BOLD}Skipped (needs sudo):${RESET}"
+        for skipped in "${SKIPPED_SUDO[@]}"; do
+            echo -e "  ${DIM}→${RESET} $skipped"
+        done
+        echo -e "  ${DIM}Run with sudo for complete scan${RESET}"
+    fi
+
+    if [[ "$has_findings" == "true" ]] || [[ ${#SKIPPED_SUDO[@]} -gt 0 ]]; then
         echo ""
     fi
 }
