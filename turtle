@@ -631,7 +631,7 @@ run_filesystem_checks() {
 
     run_check "$category" "Secure umask" 50 "check_secure_umask" || true
 
-    # Check for .env files and show count
+    # Check for .env files and show count - deduct points for each one found
     animate_turtle "Scanning for .env files"
     check_env_files || true
     add_max 50
@@ -639,7 +639,10 @@ run_filesystem_checks() {
         record_check "$category" "No .env files found" "1" "50" "50"
         add_score 50
     else
-        record_check "$category" ".env files found: $ENV_FILES_COUNT" "0" "0" "50"
+        local penalty=$((ENV_FILES_COUNT * 5))
+        [[ $penalty -gt 100 ]] && penalty=100
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" ".env files found: $ENV_FILES_COUNT" "0" "-$penalty" "50"
     fi
 }
 
@@ -877,6 +880,10 @@ print_results() {
         elif [[ "$passed" == "skip" ]]; then
             status_icon="${YELLOW}○${RESET}"
             points_display="${DIM}skip${RESET}"
+        elif [[ "$points" == -* ]]; then
+            # Negative points - bad finding
+            status_icon="${RED}✗${RESET}"
+            points_display="${RED}${points}${RESET}"
         else
             status_icon="${RED}✗${RESET}"
             points_display="${RED}+0${RESET}"
