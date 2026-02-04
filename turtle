@@ -611,6 +611,13 @@ check_secure_umask() {
     esac
 }
 
+ENV_FILES_COUNT=0
+
+check_env_files() {
+    ENV_FILES_COUNT=$(find "$HOME" -name ".env" -o -name "*.env" -o -name ".env.*" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$ENV_FILES_COUNT" -eq 0 ]]
+}
+
 run_filesystem_checks() {
     local category="FILE SYSTEM"
 
@@ -623,6 +630,17 @@ run_filesystem_checks() {
     fi
 
     run_check "$category" "Secure umask" 50 "check_secure_umask" || true
+
+    # Check for .env files and show count
+    animate_turtle "Scanning for .env files"
+    check_env_files || true
+    add_max 50
+    if [[ "$ENV_FILES_COUNT" -eq 0 ]]; then
+        record_check "$category" "No .env files found" "1" "50" "50"
+        add_score 50
+    else
+        record_check "$category" ".env files found: $ENV_FILES_COUNT" "0" "0" "50"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
