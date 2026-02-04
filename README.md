@@ -5,13 +5,13 @@ A portable security scanner for Linux/macOS with animated turtle and gamified sc
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/user/turtle-command/main/turtle | sudo install /dev/stdin /usr/local/bin/turtle
+mkdir -p ~/.local/bin && curl https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle | install /dev/stdin ~/.local/bin/turtle
 ```
 
-Or without sudo:
+Or system-wide:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/user/turtle-command/main/turtle | install /dev/stdin ~/.local/bin/turtle
+curl https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle | sudo install /dev/stdin /usr/local/bin/turtle
 ```
 
 ## Usage
