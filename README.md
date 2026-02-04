@@ -2,16 +2,10 @@
 
 A portable security scanner for Linux/macOS with animated turtle and gamified scoring.
 
-## Quick Install
+## Install
 
 ```bash
 mkdir -p ~/.local/bin && curl https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle | install /dev/stdin ~/.local/bin/turtle
-```
-
-Or system-wide:
-
-```bash
-curl https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle | sudo install /dev/stdin /usr/local/bin/turtle
 ```
 
 ## Usage
