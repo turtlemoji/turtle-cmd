@@ -1,0 +1,1118 @@
+#!/usr/bin/env bash
+#
+# Turtle Security Scanner
+# A portable security scanner with turtle animation and gamified scoring
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COLOR SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+setup_colors() {
+    if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        WHITE='\033[1;37m'
+        BOLD='\033[1m'
+        DIM='\033[2m'
+        RESET='\033[0m'
+    else
+        RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' WHITE='' BOLD='' DIM='' RESET=''
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OS DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+detect_os() {
+    OS="$(uname -s)"
+    case "$OS" in
+        Linux)  OS_TYPE="linux" ;;
+        Darwin) OS_TYPE="macos" ;;
+        *)      OS_TYPE="unknown" ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TURTLE ANIMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Big turtle frames that rotate
+TURTLE_FRAME_0='
+    _____     ____
+   /     \   /    \
+  |  O O  | |      |
+  |   >   | |  @@@@|
+   \_____/  |@@@@@@|
+      |     |@@@@@@|
+     /|\    |@@@@@@|
+    / | \    \____/
+'
+
+TURTLE_FRAME_1='
+       ____
+    __|    |__
+   /  |    |  \
+  |   | @@ |   |
+  | O |@@@@| O |
+  |   |@@@@|   |
+   \__|@@@@|__/
+      |    |
+      /\  /\
+'
+
+TURTLE_FRAME_2='
+     ____    _____
+    /    \  /     \
+   |      ||  O O  |
+   |@@@@  ||   <   |
+   |@@@@@@| \_____/
+   |@@@@@@|    |
+   |@@@@@@|   /|\
+    \____/   / | \
+'
+
+TURTLE_FRAME_3='
+      ____
+   __|@@@@|__
+  /  |@@@@|  \
+ |   |@@@@|   |
+ |   | @@ |   |
+ | O |    | O |
+  \__|    |__/
+     |    |
+     /\  /\
+'
+
+TURTLE_FRAMES_BIG=()
+TURTLE_IDX=0
+ANIMATION_RUNNING=false
+HEADER_LINES=0
+
+init_turtle_frames() {
+    TURTLE_FRAMES_BIG[0]="$TURTLE_FRAME_0"
+    TURTLE_FRAMES_BIG[1]="$TURTLE_FRAME_1"
+    TURTLE_FRAMES_BIG[2]="$TURTLE_FRAME_2"
+    TURTLE_FRAMES_BIG[3]="$TURTLE_FRAME_3"
+}
+
+# Bottom spinner for check status
+SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+SPINNER_IDX=0
+
+draw_turtle_frame() {
+    local frame_num=$1
+    local msg="$2"
+
+    # Move cursor to top
+    tput cup 0 0 2>/dev/null || printf "\033[H"
+
+    # Print header
+    echo -e "${GREEN}${BOLD}🐢 TURTLE SECURITY SCANNER 🐢${RESET} v${VERSION}"
+    echo -e "${DIM}════════════════════════════════════════${RESET}"
+
+    # Print rotating turtle
+    echo -e "${CYAN}${TURTLE_FRAMES_BIG[$frame_num]}${RESET}"
+
+    # Move to status line (after turtle art)
+    tput cup 12 0 2>/dev/null || printf "\033[13;0H"
+
+    # Show spinner and current check
+    local spinner="${SPINNER_FRAMES[$SPINNER_IDX]}"
+    local width
+    width=$(tput cols 2>/dev/null || echo 80)
+    printf "%${width}s\r" ""
+    printf "  ${GREEN}%s${RESET} ${CYAN}%s${RESET}" "$spinner" "$msg"
+
+    SPINNER_IDX=$(( (SPINNER_IDX + 1) % ${#SPINNER_FRAMES[@]} ))
+}
+
+animate_turtle() {
+    local msg="$1"
+    if [[ "$ANIMATION_RUNNING" == "true" ]]; then
+        # Animate turtle rotation with spinner
+        for _ in {1..3}; do
+            draw_turtle_frame $TURTLE_IDX "$msg"
+            TURTLE_IDX=$(( (TURTLE_IDX + 1) % 4 ))
+            sleep 0.12
+        done
+    fi
+}
+
+start_animation() {
+    ANIMATION_RUNNING=true
+    TURTLE_IDX=0
+    SPINNER_IDX=0
+    init_turtle_frames
+    tput civis 2>/dev/null || true
+    clear
+}
+
+stop_animation() {
+    ANIMATION_RUNNING=false
+    tput cnorm 2>/dev/null || true
+    clear
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCORING SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TOTAL_SCORE=0
+MAX_SCORE=0
+declare -a CHECK_RESULTS=()
+
+add_score() {
+    local points="$1"
+    TOTAL_SCORE=$((TOTAL_SCORE + points))
+}
+
+add_max() {
+    local points="$1"
+    MAX_SCORE=$((MAX_SCORE + points))
+}
+
+record_check() {
+    local category="$1"
+    local name="$2"
+    local passed="$3"
+    local points="$4"
+    local max_points="$5"
+
+    CHECK_RESULTS+=("$category|$name|$passed|$points|$max_points")
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK FRAMEWORK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+run_check() {
+    local category="$1"
+    local name="$2"
+    local max_points="$3"
+    local check_cmd="$4"
+
+    animate_turtle "$name"
+
+    add_max "$max_points"
+
+    if eval "$check_cmd" >/dev/null 2>&1; then
+        add_score "$max_points"
+        record_check "$category" "$name" "1" "$max_points" "$max_points"
+        return 0
+    else
+        record_check "$category" "$name" "0" "0" "$max_points"
+        return 1
+    fi
+}
+
+skip_check() {
+    local category="$1"
+    local name="$2"
+    local reason="$3"
+
+    record_check "$category" "$name (skipped: $reason)" "skip" "0" "0"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM SECURITY CHECKS (max ~300 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_firewall() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check ufw first, then iptables
+        if command -v ufw &>/dev/null; then
+            ufw status 2>/dev/null | grep -q "Status: active"
+        elif command -v iptables &>/dev/null; then
+            # Check if iptables has any non-default rules
+            [[ $(iptables -L -n 2>/dev/null | wc -l) -gt 8 ]]
+        elif command -v nft &>/dev/null; then
+            # Check nftables
+            [[ $(nft list ruleset 2>/dev/null | wc -l) -gt 0 ]]
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check macOS application firewall
+        /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q "enabled"
+    else
+        return 1
+    fi
+}
+
+check_auto_updates() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for unattended-upgrades on Debian/Ubuntu
+        if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+            grep -q 'APT::Periodic::Update-Package-Lists "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null
+        # Check for dnf-automatic on Fedora/RHEL
+        elif systemctl is-enabled dnf-automatic.timer &>/dev/null; then
+            return 0
+        # Check for yum-cron
+        elif systemctl is-enabled yum-cron &>/dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null | grep -q "1"
+    else
+        return 1
+    fi
+}
+
+check_sip_selinux() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check SELinux
+        if command -v getenforce &>/dev/null; then
+            [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]
+        # Check AppArmor
+        elif command -v aa-status &>/dev/null; then
+            aa-status --enabled 2>/dev/null
+        elif [[ -d /sys/kernel/security/apparmor ]]; then
+            return 0
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        csrutil status 2>/dev/null | grep -q "enabled"
+    else
+        return 1
+    fi
+}
+
+check_disk_encryption() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for LUKS encrypted partitions
+        if command -v lsblk &>/dev/null; then
+            lsblk -o TYPE 2>/dev/null | grep -q "crypt"
+        elif [[ -d /sys/class/block ]]; then
+            ls /dev/mapper/*crypt* &>/dev/null || dmsetup status 2>/dev/null | grep -q "crypt"
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        fdesetup status 2>/dev/null | grep -q "On"
+    else
+        return 1
+    fi
+}
+
+check_secure_boot() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        if [[ -d /sys/firmware/efi ]]; then
+            # Check if secure boot is enabled
+            if [[ -f /sys/firmware/efi/efivars/SecureBoot-* ]] 2>/dev/null; then
+                # Read the secure boot variable
+                local sb_file
+                sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+                if [[ -n "$sb_file" ]]; then
+                    # Last byte indicates status (1 = enabled)
+                    [[ $(od -An -t u1 "$sb_file" 2>/dev/null | awk '{print $NF}') -eq 1 ]]
+                else
+                    return 1
+                fi
+            elif command -v mokutil &>/dev/null; then
+                mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"
+            else
+                return 1
+            fi
+        else
+            return 1  # Not UEFI system
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS T2/Apple Silicon always has secure boot
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            return 0
+        elif system_profiler SPiBridgeDataType 2>/dev/null | grep -q "T2"; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        return 1
+    fi
+}
+
+run_system_checks() {
+    local category="SYSTEM SECURITY"
+
+    run_check "$category" "Firewall enabled" 100 "check_firewall" || true
+    run_check "$category" "Auto-updates configured" 50 "check_auto_updates" || true
+
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        run_check "$category" "SIP enabled" 75 "check_sip_selinux" || true
+    else
+        run_check "$category" "SELinux/AppArmor active" 75 "check_sip_selinux" || true
+    fi
+
+    run_check "$category" "Disk encryption enabled" 100 "check_disk_encryption" || true
+    run_check "$category" "Secure boot enabled" 50 "check_secure_boot" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SSH SECURITY CHECKS (max ~250 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+get_sshd_config() {
+    # Output main config
+    [[ -f /etc/ssh/sshd_config ]] && cat /etc/ssh/sshd_config 2>/dev/null
+
+    # Include any config.d files
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -f "$f" ]] && cat "$f" 2>/dev/null
+        done
+    fi
+}
+
+check_ssh_root_login() {
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+        return 1  # SSH not installed
+    fi
+    # PermitRootLogin should be "no" or "prohibit-password"
+    get_sshd_config | grep -Ei "^PermitRootLogin\s+(no|prohibit-password)" &>/dev/null
+}
+
+check_ssh_password_auth() {
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+        return 1
+    fi
+    get_sshd_config | grep -Ei "^PasswordAuthentication\s+no" &>/dev/null
+}
+
+check_ssh_non_standard_port() {
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+        return 1
+    fi
+    local port
+    port=$(get_sshd_config | grep -Ei "^Port\s+" | awk '{print $2}' | head -1)
+    [[ -n "$port" && "$port" != "22" ]]
+}
+
+check_ssh_root_authorized_keys() {
+    # Pass if root has no authorized_keys or it's empty
+    if [[ -f /root/.ssh/authorized_keys ]]; then
+        [[ ! -s /root/.ssh/authorized_keys ]]
+    else
+        return 0
+    fi
+}
+
+check_ssh_protocol() {
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+        return 1
+    fi
+    # Modern OpenSSH defaults to protocol 2, so no explicit Protocol line is fine
+    # Fail only if explicitly set to 1
+    ! get_sshd_config | grep -Ei "^Protocol\s+1" &>/dev/null
+}
+
+run_ssh_checks() {
+    local category="SSH SECURITY"
+
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+        skip_check "$category" "SSH checks" "SSH not installed"
+        return
+    fi
+
+    run_check "$category" "SSH root login disabled" 75 "check_ssh_root_login" || true
+    run_check "$category" "SSH password auth disabled" 75 "check_ssh_password_auth" || true
+    run_check "$category" "SSH non-standard port" 25 "check_ssh_non_standard_port" || true
+    run_check "$category" "No root authorized_keys" 50 "check_ssh_root_authorized_keys" || true
+    run_check "$category" "SSH protocol 2 only" 25 "check_ssh_protocol" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# USER SECURITY CHECKS (max ~250 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_user_has_password() {
+    local user
+    user=$(whoami)
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check if user has a password set (not empty or locked)
+        local passwd_entry
+        passwd_entry=$(sudo getent shadow "$user" 2>/dev/null || grep "^$user:" /etc/shadow 2>/dev/null)
+        if [[ -n "$passwd_entry" ]]; then
+            local hash
+            hash=$(echo "$passwd_entry" | cut -d: -f2)
+            # Password is set if hash doesn't start with ! or * and isn't empty
+            [[ -n "$hash" && "$hash" != "!" && "$hash" != "*" && "$hash" != "!!" ]]
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # On macOS, check if user account has password enabled
+        dscl . -read /Users/"$user" AuthenticationAuthority 2>/dev/null | grep -q "ShadowHash"
+    else
+        return 1
+    fi
+}
+
+check_no_empty_passwords() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for empty password fields in shadow
+        if [[ -r /etc/shadow ]]; then
+            ! awk -F: '($2 == "" || $2 == "!") {exit 1}' /etc/shadow 2>/dev/null
+            # Actually, we want NO empty passwords, so:
+            ! grep -E '^[^:]+::' /etc/shadow 2>/dev/null
+        else
+            return 0  # Can't read shadow, assume secure
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check all users
+        local users
+        users=$(dscl . -list /Users | grep -v "^_")
+        for u in $users; do
+            if dscl . -read /Users/"$u" Password 2>/dev/null | grep -q '^\*$'; then
+                continue  # System account
+            fi
+        done
+        return 0
+    else
+        return 1
+    fi
+}
+
+check_sudo_requires_password() {
+    # Check if NOPASSWD is set for the current user
+    if sudo -l 2>/dev/null | grep -q "NOPASSWD"; then
+        return 1  # NOPASSWD is insecure
+    fi
+    return 0
+}
+
+check_screen_lock() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for common screen lock settings
+        if command -v gsettings &>/dev/null; then
+            local lock_enabled
+            lock_enabled=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null || echo "false")
+            [[ "$lock_enabled" == "true" ]]
+        elif command -v xfconf-query &>/dev/null; then
+            xfconf-query -c xfce4-screensaver -p /lock/enabled 2>/dev/null | grep -q "true"
+        else
+            # Check if xscreensaver or similar is configured
+            [[ -f ~/.xscreensaver ]] && grep -q "lock:.*True" ~/.xscreensaver 2>/dev/null
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check if screen saver password is required
+        local ask_password
+        ask_password=$(defaults read com.apple.screensaver askForPassword 2>/dev/null || echo "0")
+        [[ "$ask_password" == "1" ]]
+    else
+        return 1
+    fi
+}
+
+check_guest_disabled() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for guest account in various DMs
+        if [[ -f /etc/lightdm/lightdm.conf ]]; then
+            grep -q "allow-guest=false" /etc/lightdm/lightdm.conf 2>/dev/null || \
+            ! grep -q "allow-guest=true" /etc/lightdm/lightdm.conf 2>/dev/null
+        else
+            # No guest configuration found, assume disabled
+            ! getent passwd guest &>/dev/null
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        local guest_enabled
+        guest_enabled=$(defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null || echo "0")
+        [[ "$guest_enabled" == "0" ]]
+    else
+        return 1
+    fi
+}
+
+run_user_checks() {
+    local category="USER SECURITY"
+
+    run_check "$category" "User has password" 50 "check_user_has_password" || true
+    run_check "$category" "No empty passwords" 75 "check_no_empty_passwords" || true
+    run_check "$category" "Sudo requires password" 50 "check_sudo_requires_password" || true
+    run_check "$category" "Screen lock enabled" 50 "check_screen_lock" || true
+    run_check "$category" "Guest account disabled" 25 "check_guest_disabled" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE SYSTEM SECURITY CHECKS (max ~250 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_no_world_writable_in_path() {
+    local found=0
+    IFS=':' read -ra path_dirs <<< "$PATH"
+    for dir in "${path_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            # Check if directory is world-writable
+            if [[ -w "$dir" ]] && [[ "$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir" 2>/dev/null)" =~ [2367]$ ]]; then
+                found=1
+                break
+            fi
+            # Check for world-writable files in PATH directories
+            if find "$dir" -maxdepth 1 -type f -perm -002 2>/dev/null | grep -q .; then
+                found=1
+                break
+            fi
+        fi
+    done
+    [[ $found -eq 0 ]]
+}
+
+check_home_permissions() {
+    local home_dir="$HOME"
+    local perms
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        perms=$(stat -c %a "$home_dir" 2>/dev/null)
+    else
+        perms=$(stat -f %Lp "$home_dir" 2>/dev/null)
+    fi
+    # Should be 700, 750, or 755 (no world-write)
+    [[ "$perms" =~ ^7[05][05]$ ]]
+}
+
+check_no_suid_in_home() {
+    # Check for SUID/SGID files in home directory
+    ! find "$HOME" -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | grep -q .
+}
+
+check_tmp_noexec() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check if /tmp is mounted with noexec
+        mount | grep " /tmp " | grep -q "noexec"
+    else
+        # Not typically done on macOS
+        return 0
+    fi
+}
+
+check_secure_umask() {
+    local current_umask
+    current_umask=$(umask)
+    # Secure umask should be 027, 077, or stricter
+    # 027 = no write for group, no access for others
+    # 077 = no access for group or others
+    case "$current_umask" in
+        0027|027|0077|077|0077|0027) return 0 ;;
+        *)
+            # Check numeric value - should mask at least group write and other rwx
+            local mask_val=$((8#$current_umask))
+            [[ $mask_val -ge $((8#027)) ]]
+            ;;
+    esac
+}
+
+run_filesystem_checks() {
+    local category="FILE SYSTEM"
+
+    run_check "$category" "No world-writable in PATH" 75 "check_no_world_writable_in_path" || true
+    run_check "$category" "Home dir permissions" 50 "check_home_permissions" || true
+    run_check "$category" "No SUID files in home" 50 "check_no_suid_in_home" || true
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        run_check "$category" "Tmp mounted noexec" 50 "check_tmp_noexec" || true
+    fi
+
+    run_check "$category" "Secure umask" 50 "check_secure_umask" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NETWORK SECURITY CHECKS (max ~200 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_open_ports() {
+    local dangerous_ports=(21 23 25 69 110 143 445 513 514)
+    local listening_ports
+
+    if command -v ss &>/dev/null; then
+        listening_ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$')
+    elif command -v netstat &>/dev/null; then
+        listening_ports=$(netstat -tlnp 2>/dev/null | awk 'NR>2 {print $4}' | grep -oE '[0-9]+$')
+    else
+        return 0  # Can't check
+    fi
+
+    for port in "${dangerous_ports[@]}"; do
+        if echo "$listening_ports" | grep -q "^${port}$"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+check_dns_encryption() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for systemd-resolved with DoT
+        if systemctl is-active systemd-resolved &>/dev/null; then
+            resolvectl status 2>/dev/null | grep -qi "DNS over TLS"
+        # Check for dnscrypt-proxy
+        elif systemctl is-active dnscrypt-proxy &>/dev/null; then
+            return 0
+        # Check resolv.conf for known DoH/DoT providers
+        elif grep -qE "(1\.1\.1\.1|8\.8\.8\.8|9\.9\.9\.9)" /etc/resolv.conf 2>/dev/null; then
+            # Known providers but might not be encrypted
+            return 1
+        else
+            return 1
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check if encrypted DNS is configured (macOS 11+)
+        if [[ -f /etc/resolver/* ]] 2>/dev/null; then
+            return 0
+        fi
+        # Check for DNS profile
+        profiles list 2>/dev/null | grep -qi "dns"
+    else
+        return 1
+    fi
+}
+
+check_no_rogue_listeners() {
+    # Check for processes listening on unusual interfaces
+    local suspicious=0
+
+    if command -v ss &>/dev/null; then
+        # Look for listeners on 0.0.0.0 (all interfaces) that might be suspicious
+        local listeners
+        listeners=$(ss -tlnp 2>/dev/null | grep "0.0.0.0" | wc -l)
+        # Allow some common services
+        [[ $listeners -lt 10 ]]
+    elif command -v lsof &>/dev/null; then
+        local listeners
+        listeners=$(lsof -i -P -n 2>/dev/null | grep LISTEN | wc -l)
+        [[ $listeners -lt 15 ]]
+    else
+        return 0
+    fi
+}
+
+check_ipv6_privacy() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check sysctl for IPv6 privacy extensions
+        local use_tempaddr
+        use_tempaddr=$(sysctl -n net.ipv6.conf.all.use_tempaddr 2>/dev/null || echo "0")
+        [[ "$use_tempaddr" -ge 1 ]]
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS has privacy extensions enabled by default
+        return 0
+    else
+        return 1
+    fi
+}
+
+run_network_checks() {
+    local category="NETWORK SECURITY"
+
+    run_check "$category" "No dangerous open ports" 75 "check_open_ports" || true
+    run_check "$category" "Encrypted DNS configured" 50 "check_dns_encryption" || true
+    run_check "$category" "Limited listening services" 50 "check_no_rogue_listeners" || true
+    run_check "$category" "IPv6 privacy extensions" 25 "check_ipv6_privacy" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SERVICES & PROCESSES CHECKS (max ~150 pts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_cron_jobs() {
+    # Check for suspicious cron jobs (ones that download/execute from internet)
+    local suspicious=0
+
+    # Check user crontab
+    if crontab -l 2>/dev/null | grep -Ei "(curl|wget|bash.*http|nc\s+-e)" &>/dev/null; then
+        suspicious=1
+    fi
+
+    # Check system cron directories
+    for crondir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+        if [[ -d "$crondir" ]]; then
+            if grep -rEi "(curl|wget).*\|.*bash" "$crondir" 2>/dev/null | grep -v "^#" &>/dev/null; then
+                suspicious=1
+            fi
+        fi
+    done
+
+    [[ $suspicious -eq 0 ]]
+}
+
+check_core_dumps_disabled() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check ulimit
+        local core_limit
+        core_limit=$(ulimit -c 2>/dev/null)
+        if [[ "$core_limit" == "0" ]]; then
+            return 0
+        fi
+
+        # Check sysctl
+        local core_pattern
+        core_pattern=$(sysctl -n kernel.core_pattern 2>/dev/null || echo "")
+        [[ "$core_pattern" == "|/bin/false" || "$core_pattern" == "" ]]
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check core dump directory
+        local core_limit
+        core_limit=$(launchctl limit core 2>/dev/null | awk '{print $2}')
+        [[ "$core_limit" == "0" ]]
+    else
+        return 1
+    fi
+}
+
+check_kernel_hardening() {
+    if [[ "$OS_TYPE" != "linux" ]]; then
+        return 0  # Skip for non-Linux
+    fi
+
+    local hardened=0
+    local total=0
+
+    # Check ASLR
+    local aslr
+    aslr=$(sysctl -n kernel.randomize_va_space 2>/dev/null || echo "0")
+    [[ "$aslr" -ge 2 ]] && ((hardened++))
+    ((total++))
+
+    # Check ptrace scope
+    local ptrace
+    ptrace=$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null || echo "0")
+    [[ "$ptrace" -ge 1 ]] && ((hardened++))
+    ((total++))
+
+    # Check dmesg restriction
+    local dmesg
+    dmesg=$(sysctl -n kernel.dmesg_restrict 2>/dev/null || echo "0")
+    [[ "$dmesg" -ge 1 ]] && ((hardened++))
+    ((total++))
+
+    # Pass if at least 2 of 3 are enabled
+    [[ $hardened -ge 2 ]]
+}
+
+run_services_checks() {
+    local category="SERVICES"
+
+    run_check "$category" "No suspicious cron jobs" 50 "check_cron_jobs" || true
+    run_check "$category" "Core dumps disabled" 50 "check_core_dumps_disabled" || true
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        run_check "$category" "Kernel hardening enabled" 50 "check_kernel_hardening" || true
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTPUT & SCORING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print_header() {
+    echo ""
+    echo -e "${GREEN}${BOLD}🐢 TURTLE SECURITY SCANNER 🐢${RESET} v${VERSION}"
+    echo -e "${DIM}════════════════════════════════════════${RESET}"
+    echo ""
+}
+
+print_header_with_turtle() {
+    echo ""
+    echo -e "${GREEN}${BOLD}🐢 TURTLE SECURITY SCANNER 🐢${RESET} v${VERSION}"
+    echo -e "${DIM}════════════════════════════════════════${RESET}"
+    echo -e "${CYAN}"
+    cat << 'EOF'
+        _____     ____
+       /     \   /    \
+      |  O O  | |      |
+      |   ^   | |  @@@@|
+       \_____/  |@@@@@@|
+          |     |@@@@@@|
+         /|\    |@@@@@@|
+        / | \    \____/
+EOF
+    echo -e "${RESET}"
+    echo -e "       ${DIM}Scan complete!${RESET}"
+    echo ""
+}
+
+print_results() {
+    local current_category=""
+
+    for result in "${CHECK_RESULTS[@]}"; do
+        IFS='|' read -r category name passed points max_points <<< "$result"
+
+        # Print category header if changed
+        if [[ "$category" != "$current_category" ]]; then
+            echo ""
+            echo -e "${BOLD}${BLUE}$category${RESET}"
+            current_category="$category"
+        fi
+
+        # Print check result
+        local status_icon points_display
+        if [[ "$passed" == "1" ]]; then
+            status_icon="${GREEN}✓${RESET}"
+            points_display="${GREEN}+${points}${RESET}"
+        elif [[ "$passed" == "skip" ]]; then
+            status_icon="${YELLOW}○${RESET}"
+            points_display="${DIM}skip${RESET}"
+        else
+            status_icon="${RED}✗${RESET}"
+            points_display="${RED}+0${RESET}"
+        fi
+
+        # Calculate padding for alignment
+        local name_len=${#name}
+        local padding=$((40 - name_len))
+        [[ $padding -lt 1 ]] && padding=1
+        local dots
+        dots=$(printf '.%.0s' $(seq 1 $padding))
+
+        printf "  %b %s ${DIM}%s${RESET} %b\n" "$status_icon" "$name" "$dots" "$points_display"
+    done
+}
+
+get_rating() {
+    local percentage=$1
+
+    if [[ $percentage -ge 90 ]]; then
+        echo "Diamond Shell"
+        return 0
+    elif [[ $percentage -ge 75 ]]; then
+        echo "Shell Guardian"
+        return 0
+    elif [[ $percentage -ge 60 ]]; then
+        echo "Steady Swimmer"
+        return 0
+    elif [[ $percentage -ge 40 ]]; then
+        echo "Soft Shell"
+        return 0
+    else
+        echo "Hatchling"
+        return 0
+    fi
+}
+
+get_turtle_rating() {
+    local percentage=$1
+
+    if [[ $percentage -ge 90 ]]; then
+        echo "5"
+    elif [[ $percentage -ge 75 ]]; then
+        echo "4"
+    elif [[ $percentage -ge 60 ]]; then
+        echo "3"
+    elif [[ $percentage -ge 40 ]]; then
+        echo "2"
+    else
+        echo "1"
+    fi
+}
+
+print_score() {
+    echo ""
+    echo -e "${DIM}════════════════════════════════════════${RESET}"
+    echo ""
+
+    # Calculate percentage
+    local percentage=0
+    if [[ $MAX_SCORE -gt 0 ]]; then
+        percentage=$((TOTAL_SCORE * 100 / MAX_SCORE))
+    fi
+
+    # Print score
+    echo -e "${BOLD}YOUR SCORE: ${WHITE}$TOTAL_SCORE / $MAX_SCORE pts${RESET}"
+
+    # Progress bar
+    local bar_width=30
+    local filled=$((percentage * bar_width / 100))
+    local empty=$((bar_width - filled))
+
+    printf "${GREEN}"
+    printf '█%.0s' $(seq 1 $filled) 2>/dev/null || true
+    printf "${DIM}"
+    printf '░%.0s' $(seq 1 $empty) 2>/dev/null || true
+    printf "${RESET} %d%%\n" "$percentage"
+
+    # Rating
+    local rating
+    rating=$(get_rating $percentage)
+    local turtle_count
+    turtle_count=$(get_turtle_rating $percentage)
+
+    echo ""
+    printf "Rating: "
+    for ((i=0; i<turtle_count; i++)); do
+        printf "🐢"
+    done
+    printf " ${BOLD}(%s)${RESET}\n" "$rating"
+
+    echo ""
+
+    # Tips based on score
+    if [[ $percentage -lt 50 ]]; then
+        echo -e "${YELLOW}Tip: Start with enabling your firewall and disk encryption!${RESET}"
+    elif [[ $percentage -lt 75 ]]; then
+        echo -e "${YELLOW}Tip: Consider hardening SSH and checking file permissions.${RESET}"
+    else
+        echo -e "${GREEN}Great job! Keep your shell strong!${RESET}"
+    fi
+
+    echo ""
+    echo -e "${DIM}Share with friends! Higher = more secure 🐢${RESET}"
+    echo ""
+}
+
+print_json_output() {
+    echo "{"
+    echo "  \"version\": \"$VERSION\","
+    echo "  \"os\": \"$OS_TYPE\","
+    echo "  \"score\": $TOTAL_SCORE,"
+    echo "  \"max_score\": $MAX_SCORE,"
+    local percentage=0
+    [[ $MAX_SCORE -gt 0 ]] && percentage=$((TOTAL_SCORE * 100 / MAX_SCORE))
+    echo "  \"percentage\": $percentage,"
+    echo "  \"rating\": \"$(get_rating $percentage)\","
+    echo "  \"checks\": ["
+
+    local first=true
+    for result in "${CHECK_RESULTS[@]}"; do
+        IFS='|' read -r category name passed points max_points <<< "$result"
+
+        [[ "$first" == "true" ]] || echo ","
+        first=false
+
+        local status="failed"
+        [[ "$passed" == "1" ]] && status="passed"
+        [[ "$passed" == "skip" ]] && status="skipped"
+
+        printf '    {"category": "%s", "name": "%s", "status": "%s", "points": %s, "max_points": %s}' \
+            "$category" "$name" "$status" "${points:-0}" "${max_points:-0}"
+    done
+
+    echo ""
+    echo "  ]"
+    echo "}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELP & USAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print_help() {
+    cat << EOF
+Turtle Security Scanner v${VERSION}
+
+Usage: turtle [OPTIONS]
+
+A portable security scanner that runs checks on your system and
+displays a gamified security score with a friendly turtle animation.
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version number
+  -j, --json     Output results in JSON format
+  -q, --quiet    Suppress animation (quieter output)
+  --no-color     Disable colored output
+
+Examples:
+  turtle              Run full security scan
+  turtle --json       Output results as JSON
+  turtle --quiet      Run without animation
+
+For more information, visit: https://github.com/your/turtle-command
+EOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    local json_output=false
+    local quiet=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            -v|--version)
+                echo "turtle v${VERSION}"
+                exit 0
+                ;;
+            -j|--json)
+                json_output=true
+                shift
+                ;;
+            -q|--quiet)
+                quiet=true
+                shift
+                ;;
+            --no-color)
+                NO_COLOR=1
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Setup
+    setup_colors
+    detect_os
+
+    if [[ "$OS_TYPE" == "unknown" ]]; then
+        echo -e "${RED}Error: Unsupported operating system${RESET}"
+        exit 1
+    fi
+
+    # Suppress animation for JSON output
+    [[ "$json_output" == "true" ]] && quiet=true
+
+    # Start animation or print static header
+    if [[ "$quiet" != "true" ]]; then
+        start_animation
+    elif [[ "$json_output" != "true" ]]; then
+        print_header
+    fi
+
+    # Run all checks
+    run_system_checks
+    run_ssh_checks
+    run_user_checks
+    run_filesystem_checks
+    run_network_checks
+    run_services_checks
+
+    # Stop animation
+    [[ "$quiet" != "true" ]] && stop_animation
+
+    # Output results
+    if [[ "$json_output" == "true" ]]; then
+        print_json_output
+    else
+        # Print header with turtle after animation
+        [[ "$quiet" != "true" ]] && print_header_with_turtle
+        [[ "$quiet" == "true" ]] || true  # quiet mode already printed header
+        print_results
+        print_score
+    fi
+}
+
+# Cleanup on exit
+cleanup() {
+    tput cnorm 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Run main
+main "$@"
