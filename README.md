@@ -5,7 +5,7 @@ A portable security scanner for Linux/macOS with animated turtle and gamified sc
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin && curl https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle | install /dev/stdin ~/.local/bin/turtle
+curl -fsSL https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/install.sh | bash
 ```
 
 ## Usage
