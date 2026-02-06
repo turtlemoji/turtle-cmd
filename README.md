@@ -19,11 +19,15 @@ turtle --help       # Show help
 
 ## Features
 
-- Rotating turtle animation during scan
-- 22 security checks across 6 categories
-- Gamified scoring (0-1400 points)
+- Hacker-style animated turtle with matrix rain, binary, hex dump, and glitch effects
+- 55+ security checks across 10 categories
+- Infostealer target detection (crypto wallets, session tokens, dev credentials)
+- Breach detection via XposedOrNot API
+- Public port exposure scanning
+- Rootkit indicator detection
+- Gamified scoring with penalties for bad findings
 - Works on Linux and macOS
-- No dependencies beyond core utils
+- No dependencies beyond core utils + curl
 
 ## Security Checks
 
@@ -32,9 +36,14 @@ turtle --help       # Show help
 | System | Firewall, auto-updates, SIP/SELinux, disk encryption, secure boot |
 | SSH | Root login, password auth, port, authorized_keys, protocol |
 | User | Passwords, sudo, screen lock, guest account |
-| File System | PATH permissions, home dir, SUID files, tmp noexec, umask |
-| Network | Open ports, encrypted DNS, listeners, IPv6 privacy |
+| File System | PATH permissions, home dir, SUID files, tmp noexec, umask, .env files |
+| Secrets & Creds | History secrets (API keys, crypto keys, seed phrases), cloud creds, private keys, shell config, git creds, SSH agent, Docker socket, dev tokens (npm/pypi/kube/docker/terraform), crypto wallets, app sessions (Discord/Slack/Telegram), VPN/WiFi configs, GPG keys, password vaults |
+| Network | Open ports, encrypted DNS, IPv6 privacy |
 | Services | Cron jobs, core dumps, kernel hardening |
+| Hardening | Failed logins, exposed services, USB automount, Bluetooth, WiFi auto-connect |
+| Best Practices | Password manager, git signing, security updates, swap encryption, kernel, SSH key audit, backup encryption, package vulnerabilities |
+| Privacy | Hostname privacy, login banner info leak, browser/VS Code telemetry, MAC randomization |
+| Advanced | ARP spoofing protection, email breach check, public port exposure, rootkit indicators |
 
 ## Rating Scale
 

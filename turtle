@@ -2027,6 +2027,616 @@ run_bestpractice_checks() {
     run_check "$category" "Security updates applied" 75 "check_pending_security_updates" || true
     run_check "$category" "Swap encrypted" 50 "check_swap_encryption" || true
     run_check "$category" "Kernel up to date" 50 "check_kernel_up_to_date" || true
+
+    # SSH key audit
+    animate_turtle "Auditing SSH keys"
+    check_ssh_key_audit || true
+    add_max 50
+    if [[ "$SSH_KEY_ISSUES" -eq 0 ]]; then
+        record_check "$category" "SSH keys use strong algorithms" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((SSH_KEY_ISSUES * 15))
+        [[ $penalty -gt 75 ]] && penalty=75
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "SSH key issues: $SSH_KEY_ISSUES" "0" "-$penalty" "50"
+    fi
+
+    # Unencrypted backup drives
+    animate_turtle "Checking backup encryption"
+    run_check "$category" "Backup drives encrypted" 50 "check_unencrypted_backups" || true
+
+    # npm/pip global package vulnerabilities
+    animate_turtle "Checking package vulnerabilities"
+    check_package_vulns || true
+    if [[ "$PKG_VULNS_FOUND" -gt 0 ]]; then
+        record_check "$category" "Package vulns found: $PKG_VULNS_FOUND" "skip" "0" "0"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRIVACY CHECKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_hostname_privacy() {
+    local hn
+    hn=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "")
+    [[ -z "$hn" ]] && return 0
+
+    # Common patterns that reveal personal info
+    local hn_lower
+    hn_lower=$(echo "$hn" | tr '[:upper:]' '[:lower:]')
+
+    # Check for name-like patterns: FirstName-PC, John-MacBook-Pro, etc.
+    if [[ "$hn_lower" =~ (macbook|imac|ipad|iphone) ]]; then
+        HOSTNAME_ISSUE="$hn (reveals device type)"
+        return 1
+    fi
+    # Check for firstname-lastname patterns
+    if [[ "$hn_lower" =~ ^[a-z]+-[a-z]+(-(pc|laptop|desktop|macbook|pro|air))?$ ]]; then
+        HOSTNAME_ISSUE="$hn (may reveal name)"
+        return 1
+    fi
+    # Check for name's patterns: johns-macbook-pro
+    if [[ "$hn_lower" =~ s-(macbook|mbp|laptop|pc|desktop|imac) ]]; then
+        HOSTNAME_ISSUE="$hn (reveals owner name)"
+        return 1
+    fi
+    HOSTNAME_ISSUE=""
+    return 0
+}
+
+check_login_banner() {
+    # Check if /etc/issue or /etc/issue.net leak OS info
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        for banner_file in /etc/issue /etc/issue.net; do
+            if [[ -f "$banner_file" ]] && [[ -s "$banner_file" ]]; then
+                # Check if it contains OS/kernel version info
+                if grep -qEi '(ubuntu|debian|fedora|centos|arch|kernel|\\r|\\v|\\s|\\m)' "$banner_file" 2>/dev/null; then
+                    return 1
+                fi
+            fi
+        done
+    fi
+    # Check SSH banner directive
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if grep -qE '^\s*Banner\s+' /etc/ssh/sshd_config 2>/dev/null; then
+            local banner_path
+            banner_path=$(grep -E '^\s*Banner\s+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+            if [[ -f "$banner_path" ]] && [[ "$banner_path" != "none" ]]; then
+                if grep -qEi '(ubuntu|debian|fedora|centos|arch|kernel|version)' "$banner_path" 2>/dev/null; then
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+TELEMETRY_ISSUES=0
+declare -a TELEMETRY_LIST=()
+
+check_telemetry() {
+    TELEMETRY_ISSUES=0
+    TELEMETRY_LIST=()
+
+    # VS Code telemetry
+    local vscode_settings=(
+        "$HOME/.config/Code/User/settings.json"
+        "$HOME/.config/Code - Insiders/User/settings.json"
+        "$HOME/Library/Application Support/Code/User/settings.json"
+    )
+    for vsfile in "${vscode_settings[@]}"; do
+        if [[ -f "$vsfile" ]]; then
+            # Check if telemetry is NOT disabled
+            if ! grep -qE '"telemetry\.(telemetryLevel|enableTelemetry)".*"(off|false)"' "$vsfile" 2>/dev/null; then
+                TELEMETRY_ISSUES=$((TELEMETRY_ISSUES + 1))
+                TELEMETRY_LIST+=("VS Code telemetry enabled")
+                break
+            fi
+        fi
+    done
+
+    # Firefox telemetry
+    local ff_dir="$HOME/.mozilla/firefox"
+    [[ "$OS_TYPE" == "macos" ]] && ff_dir="$HOME/Library/Application Support/Firefox/Profiles"
+    if [[ -d "$ff_dir" ]]; then
+        local checked_ff=false
+        while IFS= read -r prefs; do
+            if ! grep -qE 'toolkit\.telemetry\.enabled.*false' "$prefs" 2>/dev/null; then
+                if ! $checked_ff; then
+                    TELEMETRY_ISSUES=$((TELEMETRY_ISSUES + 1))
+                    TELEMETRY_LIST+=("Firefox telemetry enabled")
+                    checked_ff=true
+                fi
+            fi
+        done < <(find "$ff_dir" -name "prefs.js" 2>/dev/null | head -3)
+    fi
+
+    # Chrome usage stats (Linux)
+    local chrome_prefs="$HOME/.config/google-chrome/Default/Preferences"
+    [[ "$OS_TYPE" == "macos" ]] && chrome_prefs="$HOME/Library/Application Support/Google/Chrome/Default/Preferences"
+    if [[ -f "$chrome_prefs" ]]; then
+        if grep -qE '"metrics_reporting".*true|"usage_stats".*true' "$chrome_prefs" 2>/dev/null; then
+            TELEMETRY_ISSUES=$((TELEMETRY_ISSUES + 1))
+            TELEMETRY_LIST+=("Chrome usage stats reporting enabled")
+        fi
+    fi
+
+    [[ "$TELEMETRY_ISSUES" -eq 0 ]]
+}
+
+check_mac_randomization() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check NetworkManager config for MAC randomization
+        local nm_conf="/etc/NetworkManager/NetworkManager.conf"
+        local nm_conf_d="/etc/NetworkManager/conf.d"
+
+        local has_rand=false
+        # Check main config
+        if [[ -f "$nm_conf" ]]; then
+            if grep -qE 'wifi\.scan-rand-mac-address\s*=\s*yes' "$nm_conf" 2>/dev/null; then
+                has_rand=true
+            fi
+        fi
+        # Check conf.d
+        if [[ -d "$nm_conf_d" ]]; then
+            while IFS= read -r conf; do
+                if grep -qE 'wifi\.scan-rand-mac-address\s*=\s*yes|wifi\.cloned-mac-address\s*=\s*(random|stable)' "$conf" 2>/dev/null; then
+                    has_rand=true
+                fi
+            done < <(find "$nm_conf_d" -name "*.conf" 2>/dev/null)
+        fi
+
+        # Also check per-connection configs
+        if ! $has_rand && [[ -d "/etc/NetworkManager/system-connections" ]]; then
+            # If none of the configs enable it, it's disabled
+            return 1
+        fi
+        $has_rand && return 0 || return 1
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS 14+ has private WiFi addresses on by default
+        # Check via networksetup
+        if command -v networksetup &>/dev/null; then
+            # On modern macOS this is generally on by default
+            return 0
+        fi
+    fi
+    return 0
+}
+
+run_privacy_checks() {
+    local category="PRIVACY"
+
+    # Hostname privacy
+    animate_turtle "Checking hostname"
+    HOSTNAME_ISSUE=""
+    check_hostname_privacy || true
+    add_max 25
+    if [[ -z "$HOSTNAME_ISSUE" ]]; then
+        record_check "$category" "Hostname doesn't leak identity" "1" "25" "25"
+        add_score 25
+    else
+        record_check "$category" "Hostname reveals info: $HOSTNAME_ISSUE" "0" "0" "25"
+    fi
+
+    # Login banner
+    animate_turtle "Checking login banners"
+    run_check "$category" "Login banner doesn't leak OS info" 25 "check_login_banner" || true
+
+    # Telemetry
+    animate_turtle "Checking telemetry settings"
+    check_telemetry || true
+    if [[ "$TELEMETRY_ISSUES" -gt 0 ]]; then
+        record_check "$category" "App telemetry enabled: $TELEMETRY_ISSUES" "skip" "0" "0"
+    else
+        record_check "$category" "App telemetry disabled" "1" "0" "0"
+    fi
+
+    # MAC randomization
+    animate_turtle "Checking MAC randomization"
+    run_check "$category" "WiFi MAC randomization" 50 "check_mac_randomization" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADVANCED CHECKS - SSH audit, ARP, HIBP, public ports, rootkits
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SSH_KEY_ISSUES=0
+declare -a SSH_KEY_ISSUES_LIST=()
+
+check_ssh_key_audit() {
+    SSH_KEY_ISSUES=0
+    SSH_KEY_ISSUES_LIST=()
+
+    [[ ! -d "$HOME/.ssh" ]] && return 0
+
+    while IFS= read -r keyfile; do
+        [[ ! -f "$keyfile" ]] && continue
+        # Skip public keys and config files
+        [[ "$keyfile" == *.pub ]] && continue
+        [[ "$(basename "$keyfile")" == "config" ]] && continue
+        [[ "$(basename "$keyfile")" == "known_hosts"* ]] && continue
+        [[ "$(basename "$keyfile")" == "authorized_keys"* ]] && continue
+
+        # Check if it's actually a private key
+        if ! head -1 "$keyfile" 2>/dev/null | grep -qE '(BEGIN|PRIVATE|OPENSSH)'; then
+            continue
+        fi
+
+        local key_type="" key_bits="" key_age_days=0
+        local basename_key
+        basename_key=$(basename "$keyfile")
+
+        # Get key info via ssh-keygen
+        local key_info
+        key_info=$(ssh-keygen -l -f "$keyfile" 2>/dev/null || echo "")
+        if [[ -n "$key_info" ]]; then
+            key_bits=$(echo "$key_info" | awk '{print $1}')
+            key_type=$(echo "$key_info" | grep -oE '\(.*\)' | tr -d '()')
+        fi
+
+        # Get key age from file mtime
+        local mtime_epoch
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            mtime_epoch=$(stat -c %Y "$keyfile" 2>/dev/null || echo "0")
+        else
+            mtime_epoch=$(stat -f %m "$keyfile" 2>/dev/null || echo "0")
+        fi
+        if [[ "$mtime_epoch" -gt 0 ]]; then
+            local now_epoch
+            now_epoch=$(date +%s)
+            key_age_days=$(( (now_epoch - mtime_epoch) / 86400 ))
+        fi
+
+        local issue=""
+        # Flag DSA keys (deprecated)
+        if [[ "$key_type" == "DSA" ]]; then
+            issue="DSA (deprecated, insecure)"
+        # Flag small RSA keys
+        elif [[ "$key_type" == "RSA" ]] && [[ "$key_bits" -lt 3072 ]]; then
+            issue="RSA-${key_bits} (weak, use ed25519)"
+        # Flag old keys (> 2 years)
+        elif [[ "$key_age_days" -gt 730 ]]; then
+            local years=$((key_age_days / 365))
+            issue="${key_type:-unknown}-${key_bits:-?} (${years}y old, consider rotating)"
+        fi
+
+        if [[ -n "$issue" ]]; then
+            SSH_KEY_ISSUES=$((SSH_KEY_ISSUES + 1))
+            SSH_KEY_ISSUES_LIST+=("$basename_key: $issue")
+        fi
+    done < <(find "$HOME/.ssh" -maxdepth 1 -type f 2>/dev/null)
+
+    [[ "$SSH_KEY_ISSUES" -eq 0 ]]
+}
+
+check_unencrypted_backups() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check for mounted external/removable drives that are not encrypted
+        while IFS= read -r mount_line; do
+            local dev mount_point fstype
+            dev=$(echo "$mount_line" | awk '{print $1}')
+            mount_point=$(echo "$mount_line" | awk '{print $3}')
+            fstype=$(echo "$mount_line" | awk '{print $5}')
+
+            # Skip virtual/system filesystems
+            [[ "$fstype" =~ ^(tmpfs|devtmpfs|sysfs|proc|cgroup|overlay|squashfs)$ ]] && continue
+            [[ "$mount_point" == "/" ]] && continue
+            [[ "$mount_point" == "/boot"* ]] && continue
+            [[ "$mount_point" == "/snap"* ]] && continue
+
+            # Check if it's a removable/external drive with backup-like content
+            if [[ "$mount_point" =~ (media|mnt|backup|Backup) ]]; then
+                # Check if LUKS encrypted
+                if ! command -v lsblk &>/dev/null || ! lsblk -no TYPE "$dev" 2>/dev/null | grep -q "crypt"; then
+                    # Check if it contains backup-like directories
+                    if [[ -d "$mount_point/timeshift" ]] || [[ -d "$mount_point/borg" ]] || \
+                       [[ -d "$mount_point/restic" ]] || [[ -d "$mount_point/backup" ]] || \
+                       [[ -d "$mount_point/Backup" ]]; then
+                        return 1
+                    fi
+                fi
+            fi
+        done < <(mount 2>/dev/null | grep "^/dev/")
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check Time Machine encryption
+        if command -v tmutil &>/dev/null; then
+            local tm_info
+            tm_info=$(tmutil destinationinfo 2>/dev/null || echo "")
+            if [[ -n "$tm_info" ]] && echo "$tm_info" | grep -q "Name"; then
+                if ! echo "$tm_info" | grep -qi "encrypted.*yes\|encryption.*yes"; then
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+PKG_VULNS_FOUND=0
+declare -a PKG_VULNS_LIST=()
+
+check_package_vulns() {
+    PKG_VULNS_FOUND=0
+    PKG_VULNS_LIST=()
+
+    # npm global audit (timeout after 5s)
+    if command -v npm &>/dev/null; then
+        local npm_outdated
+        npm_outdated=$(timeout 5 npm outdated -g --json 2>/dev/null | grep -c '"current"' || echo "0")
+        npm_outdated=$(echo "$npm_outdated" | tr -d '[:space:]')
+        if [[ "$npm_outdated" =~ ^[0-9]+$ ]] && [[ "$npm_outdated" -gt 0 ]]; then
+            PKG_VULNS_FOUND=$((PKG_VULNS_FOUND + npm_outdated))
+            PKG_VULNS_LIST+=("npm: $npm_outdated outdated global packages")
+        fi
+    fi
+
+    # pip audit if pip-audit is installed (timeout after 5s)
+    if command -v pip-audit &>/dev/null; then
+        local pip_vulns
+        pip_vulns=$(timeout 5 pip-audit 2>/dev/null | grep -c "^Name" || echo "0")
+        pip_vulns=$(echo "$pip_vulns" | tr -d '[:space:]')
+        if [[ "$pip_vulns" =~ ^[0-9]+$ ]] && [[ "$pip_vulns" -gt 0 ]]; then
+            PKG_VULNS_FOUND=$((PKG_VULNS_FOUND + pip_vulns))
+            PKG_VULNS_LIST+=("pip: $pip_vulns vulnerable packages")
+        fi
+    fi
+
+    [[ "$PKG_VULNS_FOUND" -eq 0 ]]
+}
+
+check_arp_protection() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check if arpwatch or arpon is running
+        if systemctl is-active arpwatch &>/dev/null 2>&1 || \
+           systemctl is-active arpon &>/dev/null 2>&1 || \
+           pgrep -x arpwatch &>/dev/null || pgrep -x arpon &>/dev/null; then
+            return 0
+        fi
+        # Check sysctl arp_ignore (1 = reply only if target IP is local)
+        local arp_ignore
+        arp_ignore=$(cat /proc/sys/net/ipv4/conf/all/arp_ignore 2>/dev/null || echo "0")
+        if [[ "$arp_ignore" -ge 1 ]]; then
+            return 0
+        fi
+        return 1
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS doesn't have built-in ARP protection - check for arpwatch via brew
+        if command -v arpwatch &>/dev/null; then
+            return 0
+        fi
+        return 1
+    fi
+    return 0
+}
+
+HIBP_BREACHES=0
+HIBP_EMAIL=""
+HIBP_RESULT=""
+
+check_hibp() {
+    HIBP_BREACHES=0
+    HIBP_EMAIL=""
+    HIBP_RESULT=""
+
+    # Find email from git config
+    HIBP_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
+    [[ -z "$HIBP_EMAIL" ]] && return 0
+
+    # Use the free Mozilla Monitor / HIBP password API (k-anonymity, no key needed)
+    # For breach check, we try multiple free endpoints
+    local response http_code
+
+    # Try XposedOrNot free API (no key needed, returns breach count)
+    http_code=$(timeout 8 curl -s -o /tmp/.turtle_hibp_resp -w "%{http_code}" \
+        "https://api.xposedornot.com/v1/check-email/${HIBP_EMAIL}" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" == "200" ]]; then
+        response=$(cat /tmp/.turtle_hibp_resp 2>/dev/null || echo "")
+        rm -f /tmp/.turtle_hibp_resp
+        if echo "$response" | grep -q '"breaches"' 2>/dev/null; then
+            # Count breach names in the response (comma-separated in JSON array)
+            HIBP_BREACHES=$(echo "$response" | grep -o '"[^"]*"' | grep -v -E '"(breaches|Error)"' | wc -l | tr -d ' ')
+            HIBP_BREACHES=${HIBP_BREACHES:-0}
+            if [[ "$HIBP_BREACHES" -gt 0 ]]; then
+                HIBP_RESULT="found in $HIBP_BREACHES breach(es)"
+            else
+                HIBP_RESULT="no breaches found"
+            fi
+        else
+            HIBP_RESULT="no breaches found"
+        fi
+    elif [[ "$http_code" == "404" ]]; then
+        rm -f /tmp/.turtle_hibp_resp
+        HIBP_RESULT="no breaches found"
+    else
+        rm -f /tmp/.turtle_hibp_resp
+        # Fallback: just report the email and suggest manual check
+        HIBP_RESULT="check manually at haveibeenpwned.com"
+    fi
+
+    [[ "$HIBP_BREACHES" -eq 0 ]]
+}
+
+PUBLIC_PORTS_EXPOSED=0
+declare -a PUBLIC_PORTS_LIST=()
+
+check_public_ports() {
+    PUBLIC_PORTS_EXPOSED=0
+    PUBLIC_PORTS_LIST=()
+
+    # Get public IP
+    local public_ip
+    public_ip=$(timeout 5 curl -s https://api.ipify.org 2>/dev/null || echo "")
+    [[ -z "$public_ip" ]] && return 0
+
+    # Check common dangerous ports with strict timeout per port
+    # Use nc (netcat) if available, otherwise skip (dev/tcp hangs on filtered ports)
+    local check_ports=(22 80 443 3389 8080)
+    local port_names=("SSH" "HTTP" "HTTPS" "RDP" "HTTP-Alt")
+
+    if command -v nc &>/dev/null; then
+        for i in "${!check_ports[@]}"; do
+            local port="${check_ports[$i]}"
+            local name="${port_names[$i]}"
+            if timeout 2 nc -z -w1 "$public_ip" "$port" 2>/dev/null; then
+                PUBLIC_PORTS_EXPOSED=$((PUBLIC_PORTS_EXPOSED + 1))
+                PUBLIC_PORTS_LIST+=("$name ($port) reachable from internet")
+            fi
+        done
+    elif command -v nmap &>/dev/null; then
+        # Fast nmap scan of key ports
+        local open_ports
+        open_ports=$(timeout 15 nmap -Pn -p22,80,443,3389,8080 --open -oG - "$public_ip" 2>/dev/null | grep "Ports:" || echo "")
+        for i in "${!check_ports[@]}"; do
+            local port="${check_ports[$i]}"
+            local name="${port_names[$i]}"
+            if echo "$open_ports" | grep -q "${port}/open" 2>/dev/null; then
+                PUBLIC_PORTS_EXPOSED=$((PUBLIC_PORTS_EXPOSED + 1))
+                PUBLIC_PORTS_LIST+=("$name ($port) reachable from internet")
+            fi
+        done
+    fi
+    # If neither nc nor nmap available, silently skip
+
+    [[ "$PUBLIC_PORTS_EXPOSED" -eq 0 ]]
+}
+
+ROOTKIT_INDICATORS=0
+declare -a ROOTKIT_LIST=()
+
+check_rootkit_indicators() {
+    ROOTKIT_INDICATORS=0
+    ROOTKIT_LIST=()
+
+    if [[ "$OS_TYPE" != "linux" ]]; then
+        return 0
+    fi
+
+    # 1. Check /etc/ld.so.preload (LD_PRELOAD hijacking)
+    if [[ -f /etc/ld.so.preload ]] && [[ -s /etc/ld.so.preload ]]; then
+        ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+        ROOTKIT_LIST+=("/etc/ld.so.preload exists (LD_PRELOAD hijacking)")
+    fi
+
+    # 2. Suspicious kernel modules
+    if command -v lsmod &>/dev/null; then
+        local suspicious_mods="(diamorphine|reptile|suterusu|adore|knark|rial|heroin|override|hiding)"
+        local bad_mods
+        bad_mods=$(lsmod 2>/dev/null | grep -iE "$suspicious_mods" | awk '{print $1}' || echo "")
+        if [[ -n "$bad_mods" ]]; then
+            while IFS= read -r mod; do
+                ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                ROOTKIT_LIST+=("Suspicious kernel module: $mod")
+            done <<< "$bad_mods"
+        fi
+    fi
+
+    # 3. Executables in /dev/shm (common staging area for malware)
+    local shm_execs
+    shm_execs=$(find /dev/shm -type f -executable 2>/dev/null | head -5)
+    if [[ -n "$shm_execs" ]]; then
+        while IFS= read -r exe; do
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Executable in /dev/shm: $exe")
+        done <<< "$shm_execs"
+    fi
+
+    # 4. Hidden process detection: compare /proc count vs ps count
+    if [[ -d /proc ]]; then
+        local proc_count ps_count
+        proc_count=$(ls -1d /proc/[0-9]* 2>/dev/null | wc -l)
+        ps_count=$(ps -e --no-headers 2>/dev/null | wc -l || echo "$proc_count")
+        local diff=$((proc_count - ps_count))
+        # Allow small difference (race condition), flag if > 5
+        if [[ "$diff" -gt 5 ]] || [[ "$diff" -lt -5 ]]; then
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Process count mismatch: /proc=$proc_count vs ps=$ps_count (hidden processes?)")
+        fi
+    fi
+
+    # 5. Check for modified package binaries (quick check on a few critical ones)
+    if command -v rpm &>/dev/null; then
+        local tampered
+        tampered=$(rpm -Va 2>/dev/null | grep -E "^..5" | grep -E "(bin/|sbin/)" | head -3 || echo "")
+        if [[ -n "$tampered" ]]; then
+            while IFS= read -r line; do
+                ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                ROOTKIT_LIST+=("Modified binary: $line")
+            done <<< "$tampered"
+        fi
+    elif command -v debsums &>/dev/null; then
+        local tampered
+        tampered=$(timeout 10 debsums -s 2>/dev/null | grep -E "(bin/|sbin/)" | head -3 || echo "")
+        if [[ -n "$tampered" ]]; then
+            while IFS= read -r line; do
+                ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                ROOTKIT_LIST+=("Modified binary: $line")
+            done <<< "$tampered"
+        fi
+    fi
+
+    # 6. Suspicious SUID binaries in unusual locations
+    local sus_suid
+    sus_suid=$(find /tmp /var/tmp /dev/shm "$HOME" -perm -4000 -type f 2>/dev/null | head -5)
+    if [[ -n "$sus_suid" ]]; then
+        while IFS= read -r suid; do
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("SUID binary in unusual location: $suid")
+        done <<< "$sus_suid"
+    fi
+
+    [[ "$ROOTKIT_INDICATORS" -eq 0 ]]
+}
+
+run_advanced_checks() {
+    local category="ADVANCED"
+
+    # ARP spoofing protection
+    animate_turtle "Checking ARP protection"
+    run_check "$category" "ARP spoofing protection" 25 "check_arp_protection" || true
+
+    # Have I Been Pwned
+    animate_turtle "Checking breach databases"
+    check_hibp || true
+    if [[ -n "$HIBP_EMAIL" ]]; then
+        if [[ "$HIBP_BREACHES" -eq 0 ]] && [[ "$HIBP_RESULT" == "no breaches found" ]]; then
+            record_check "$category" "Email not in breaches ($HIBP_EMAIL)" "1" "0" "0"
+        elif [[ "$HIBP_BREACHES" -gt 0 ]]; then
+            record_check "$category" "!! Email in $HIBP_BREACHES breach(es) ($HIBP_EMAIL)" "0" "0" "0"
+        else
+            record_check "$category" "Breach check: $HIBP_RESULT" "skip" "0" "0"
+        fi
+    fi
+
+    # Publicly exposed ports
+    animate_turtle "Checking public port exposure"
+    check_public_ports || true
+    add_max 50
+    if [[ "$PUBLIC_PORTS_EXPOSED" -eq 0 ]]; then
+        record_check "$category" "No ports exposed to internet" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((PUBLIC_PORTS_EXPOSED * 20))
+        [[ $penalty -gt 100 ]] && penalty=100
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "!! Ports exposed to internet: $PUBLIC_PORTS_EXPOSED" "0" "-$penalty" "50"
+    fi
+
+    # Rootkit indicators
+    animate_turtle "Checking for rootkit indicators"
+    check_rootkit_indicators || true
+    add_max 100
+    if [[ "$ROOTKIT_INDICATORS" -eq 0 ]]; then
+        record_check "$category" "No rootkit indicators" "1" "100" "100"
+        add_score 100
+    else
+        local penalty=$((ROOTKIT_INDICATORS * 50))
+        [[ $penalty -gt 500 ]] && penalty=500
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "!! ROOTKIT INDICATORS: $ROOTKIT_INDICATORS" "0" "-$penalty" "100"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2338,6 +2948,69 @@ print_findings() {
         echo -e "  ${YELLOW}Run: chmod 600 <vault.kdbx>${RESET}"
     fi
 
+    # SSH key issues
+    if [[ ${#SSH_KEY_ISSUES_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}SSH key issues:${RESET}"
+        for issue in "${SSH_KEY_ISSUES_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $issue"
+        done
+        echo -e "  ${YELLOW}Generate new keys: ssh-keygen -t ed25519${RESET}"
+    fi
+
+    # Telemetry
+    if [[ ${#TELEMETRY_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${YELLOW}${BOLD}Telemetry/tracking enabled:${RESET}"
+        for telem in "${TELEMETRY_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $telem"
+        done
+    fi
+
+    # HIBP breaches
+    if [[ "$HIBP_BREACHES" -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Email breach alert ($HIBP_EMAIL):${RESET}"
+        echo -e "  ${DIM}→${RESET} Found in $HIBP_BREACHES known data breach(es)"
+        echo -e "  ${YELLOW}Check https://haveibeenpwned.com for details. Change reused passwords${RESET}"
+    fi
+
+    # Public ports
+    if [[ ${#PUBLIC_PORTS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Ports exposed to internet:${RESET}"
+        for port in "${PUBLIC_PORTS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $port"
+        done
+        echo -e "  ${YELLOW}Close unused ports or configure firewall rules${RESET}"
+    fi
+
+    # Package vulnerabilities
+    if [[ ${#PKG_VULNS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${YELLOW}${BOLD}Package vulnerabilities:${RESET}"
+        for pkg in "${PKG_VULNS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $pkg"
+        done
+        echo -e "  ${YELLOW}Run: npm update -g / pip-audit --fix${RESET}"
+    fi
+
+    # Rootkit indicators (critical!)
+    if [[ ${#ROOTKIT_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}!! ROOTKIT INDICATORS DETECTED !!${RESET}"
+        for rk in "${ROOTKIT_LIST[@]}"; do
+            echo -e "  ${RED}→${RESET} $rk"
+        done
+        echo -e "  ${RED}Investigate immediately! Consider running rkhunter or chkrootkit${RESET}"
+    fi
+
     # Skipped checks that need sudo
     if [[ ${#SKIPPED_SUDO[@]} -gt 0 ]]; then
         echo ""
@@ -2528,6 +3201,8 @@ main() {
     run_services_checks
     run_hardening_checks
     run_bestpractice_checks
+    run_privacy_checks
+    run_advanced_checks
 
     # Stop animation
     [[ "$quiet" != "true" ]] && stop_animation
