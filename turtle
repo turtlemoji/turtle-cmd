@@ -1077,6 +1077,64 @@ run_secrets_checks() {
     # Docker socket
     animate_turtle "Checking Docker socket"
     run_check "$category" "Docker socket protected" 50 "check_docker_socket" || true
+
+    # Crypto wallets on disk (informational - these are stealer targets)
+    animate_turtle "Scanning for crypto wallets"
+    check_crypto_wallets || true
+    if [[ "$CRYPTO_WALLETS_FOUND" -gt 0 ]]; then
+        record_check "$category" "!! Crypto wallets found: $CRYPTO_WALLETS_FOUND (stealer target)" "skip" "0" "0"
+    fi
+
+    # Dev tokens (npm, pypi, netrc, kube, docker, terraform)
+    animate_turtle "Checking dev tokens"
+    check_dev_tokens || true
+    add_max 50
+    if [[ "$DEV_TOKENS_FOUND" -eq 0 ]]; then
+        record_check "$category" "No exposed dev tokens" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((DEV_TOKENS_FOUND * 20))
+        [[ $penalty -gt 100 ]] && penalty=100
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "!! Exposed dev tokens: $DEV_TOKENS_FOUND" "0" "-$penalty" "50"
+    fi
+
+    # Session tokens (Discord, Slack, Telegram - informational)
+    animate_turtle "Checking app sessions"
+    check_session_tokens || true
+    if [[ "$SESSION_TOKENS_FOUND" -gt 0 ]]; then
+        record_check "$category" "App sessions found: $SESSION_TOKENS_FOUND (stealer target)" "skip" "0" "0"
+    fi
+
+    # VPN/WiFi configs with embedded keys
+    animate_turtle "Checking VPN & WiFi configs"
+    check_vpn_wifi_configs || true
+    add_max 50
+    if [[ "$VPN_CONFIGS_FOUND" -eq 0 ]]; then
+        record_check "$category" "No exposed VPN/WiFi creds" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((VPN_CONFIGS_FOUND * 20))
+        [[ $penalty -gt 100 ]] && penalty=100
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "!! Exposed VPN/WiFi creds: $VPN_CONFIGS_FOUND" "0" "-$penalty" "50"
+    fi
+
+    # GPG key protection
+    animate_turtle "Checking GPG keys"
+    check_gpg_protection || true
+    if [[ "$GPG_WEAK_KEYS" -gt 0 ]]; then
+        TOTAL_SCORE=$((TOTAL_SCORE - 25))
+        record_check "$category" "GPG directory weak permissions" "0" "-25" "0"
+    fi
+
+    # Password vault file permissions
+    animate_turtle "Checking password vaults"
+    check_password_vault_files || true
+    if [[ "$VAULT_ISSUES" -gt 0 ]]; then
+        TOTAL_SCORE=$((TOTAL_SCORE - 25))
+        record_check "$category" "!! Password vault bad perms: $VAULT_ISSUES" "0" "-25" "0"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1152,6 +1210,355 @@ check_docker_socket() {
         fi
     fi
     return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INFOSTEALER TARGET CHECKS - things malware looks for
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Crypto wallet files on disk
+CRYPTO_WALLETS_FOUND=0
+declare -a CRYPTO_WALLETS_LIST=()
+
+check_crypto_wallets() {
+    CRYPTO_WALLETS_FOUND=0
+    CRYPTO_WALLETS_LIST=()
+
+    # Bitcoin Core
+    local btc_paths=("$HOME/.bitcoin/wallet.dat" "$HOME/Library/Application Support/Bitcoin/wallet.dat")
+    # Electrum
+    local electrum_paths=("$HOME/.electrum/wallets" "$HOME/.local/share/electrum/wallets" "$HOME/Library/Application Support/Electrum/wallets")
+    # Ethereum
+    local eth_paths=("$HOME/.ethereum/keystore" "$HOME/Library/Ethereum/keystore")
+    # Monero
+    local xmr_paths=("$HOME/.bitmonero" "$HOME/Monero/wallets")
+    # App wallets (Exodus, Atomic, Wasabi)
+    local app_paths=(
+        "$HOME/.config/Exodus/exodus.wallet"
+        "$HOME/Library/Application Support/exodus/exodus.wallet"
+        "$HOME/.config/atomic/Local Storage"
+        "$HOME/Library/Application Support/atomic/Local Storage"
+        "$HOME/.WasabiWallet/Wallets"
+    )
+
+    # Check direct wallet files
+    for wpath in "${btc_paths[@]}"; do
+        if [[ -f "$wpath" ]]; then
+            CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+            CRYPTO_WALLETS_LIST+=("Bitcoin Core: $wpath")
+        fi
+    done
+
+    # Check wallet directories
+    for wpath in "${electrum_paths[@]}"; do
+        if [[ -d "$wpath" ]] && [[ -n "$(ls -A "$wpath" 2>/dev/null)" ]]; then
+            CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+            CRYPTO_WALLETS_LIST+=("Electrum: $wpath")
+        fi
+    done
+
+    for wpath in "${eth_paths[@]}"; do
+        if [[ -d "$wpath" ]] && [[ -n "$(ls -A "$wpath" 2>/dev/null)" ]]; then
+            CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+            CRYPTO_WALLETS_LIST+=("Ethereum keystore: $wpath")
+        fi
+    done
+
+    for wpath in "${xmr_paths[@]}"; do
+        if [[ -d "$wpath" ]]; then
+            CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+            CRYPTO_WALLETS_LIST+=("Monero: $wpath")
+        fi
+    done
+
+    for wpath in "${app_paths[@]}"; do
+        if [[ -d "$wpath" ]] || [[ -f "$wpath" ]]; then
+            local name
+            name=$(echo "$wpath" | grep -oE '(Exodus|exodus|atomic|Atomic|WasabiWallet)' | head -1)
+            CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+            CRYPTO_WALLETS_LIST+=("$name: $wpath")
+        fi
+    done
+
+    # Check for MetaMask/Phantom in browser extension data
+    local chrome_ext_dir="$HOME/.config/google-chrome/Default/Local Extension Settings"
+    local brave_ext_dir="$HOME/.config/BraveSoftware/Brave-Browser/Default/Local Extension Settings"
+    local firefox_dir="$HOME/.mozilla/firefox"
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        chrome_ext_dir="$HOME/Library/Application Support/Google/Chrome/Default/Local Extension Settings"
+        brave_ext_dir="$HOME/Library/Application Support/BraveSoftware/Brave-Browser/Default/Local Extension Settings"
+        firefox_dir="$HOME/Library/Application Support/Firefox/Profiles"
+    fi
+
+    # MetaMask extension ID
+    local metamask_id="nkbihfbeogaeaoehlefnkodbefgpgknn"
+    if [[ -d "$chrome_ext_dir/$metamask_id" ]] || [[ -d "$brave_ext_dir/$metamask_id" ]]; then
+        CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+        CRYPTO_WALLETS_LIST+=("MetaMask (browser extension)")
+    fi
+
+    # Phantom extension ID
+    local phantom_id="bfnaelmomeimhlpmgjnjophhpkkoljpa"
+    if [[ -d "$chrome_ext_dir/$phantom_id" ]] || [[ -d "$brave_ext_dir/$phantom_id" ]]; then
+        CRYPTO_WALLETS_FOUND=$((CRYPTO_WALLETS_FOUND + 1))
+        CRYPTO_WALLETS_LIST+=("Phantom (browser extension)")
+    fi
+
+    # Informational only - just report existence, these are targets for stealers
+    [[ "$CRYPTO_WALLETS_FOUND" -eq 0 ]]
+}
+
+# Dev tokens: .npmrc, .pypirc, .netrc, kube, docker
+DEV_TOKENS_FOUND=0
+declare -a DEV_TOKENS_LIST=()
+
+check_dev_tokens() {
+    DEV_TOKENS_FOUND=0
+    DEV_TOKENS_LIST=()
+
+    # .npmrc with auth token
+    if [[ -f "$HOME/.npmrc" ]]; then
+        if grep -qE '(//.*:_authToken=|_auth=|_password=)' "$HOME/.npmrc" 2>/dev/null; then
+            DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + 1))
+            DEV_TOKENS_LIST+=("~/.npmrc (contains auth token)")
+        fi
+    fi
+
+    # .pypirc with password
+    if [[ -f "$HOME/.pypirc" ]]; then
+        if grep -qE '(password|token)\s*=' "$HOME/.pypirc" 2>/dev/null; then
+            DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + 1))
+            DEV_TOKENS_LIST+=("~/.pypirc (contains password/token)")
+        fi
+    fi
+
+    # .netrc with passwords
+    if [[ -f "$HOME/.netrc" ]]; then
+        if grep -qiE 'password' "$HOME/.netrc" 2>/dev/null; then
+            DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + 1))
+            DEV_TOKENS_LIST+=("~/.netrc (contains passwords)")
+        fi
+        # Check permissions
+        local perms
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            perms=$(stat -c %a "$HOME/.netrc" 2>/dev/null)
+        else
+            perms=$(stat -f %Lp "$HOME/.netrc" 2>/dev/null)
+        fi
+        if [[ -n "$perms" ]] && [[ "$perms" != "600" ]] && [[ "$perms" != "400" ]]; then
+            DEV_TOKENS_LIST+=("~/.netrc bad permissions (mode: $perms, should be 600)")
+        fi
+    fi
+
+    # Kubernetes config with credentials
+    if [[ -f "$HOME/.kube/config" ]]; then
+        if grep -qE '(client-certificate-data|client-key-data|token:|password:)' "$HOME/.kube/config" 2>/dev/null; then
+            DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + 1))
+            DEV_TOKENS_LIST+=("~/.kube/config (contains credentials)")
+        fi
+    fi
+
+    # Docker registry auth
+    if [[ -f "$HOME/.docker/config.json" ]]; then
+        if grep -qE '"auth"' "$HOME/.docker/config.json" 2>/dev/null; then
+            DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + 1))
+            DEV_TOKENS_LIST+=("~/.docker/config.json (contains registry auth)")
+        fi
+    fi
+
+    # Terraform state with secrets
+    local tf_count=0
+    while IFS= read -r tfstate; do
+        tf_count=$((tf_count + 1))
+        [[ $tf_count -le 3 ]] && DEV_TOKENS_LIST+=("$tfstate (may contain plaintext secrets)")
+    done < <(find "$HOME" -maxdepth 4 -name "terraform.tfstate" \
+        -not -path "*/.terraform/*" \
+        -not -path "*/.cache/*" 2>/dev/null | head -5)
+    if [[ $tf_count -gt 0 ]]; then
+        DEV_TOKENS_FOUND=$((DEV_TOKENS_FOUND + tf_count))
+    fi
+
+    [[ "$DEV_TOKENS_FOUND" -eq 0 ]]
+}
+
+# Session tokens: Discord, Slack, Telegram
+SESSION_TOKENS_FOUND=0
+declare -a SESSION_TOKENS_LIST=()
+
+check_session_tokens() {
+    SESSION_TOKENS_FOUND=0
+    SESSION_TOKENS_LIST=()
+
+    # Discord tokens
+    local discord_paths=(
+        "$HOME/.config/discord/Local Storage/leveldb"
+        "$HOME/.config/discordcanary/Local Storage/leveldb"
+        "$HOME/Library/Application Support/discord/Local Storage/leveldb"
+    )
+    for dpath in "${discord_paths[@]}"; do
+        if [[ -d "$dpath" ]]; then
+            SESSION_TOKENS_FOUND=$((SESSION_TOKENS_FOUND + 1))
+            SESSION_TOKENS_LIST+=("Discord session: $dpath")
+        fi
+    done
+
+    # Slack tokens
+    local slack_paths=(
+        "$HOME/.config/Slack/Local Storage/leveldb"
+        "$HOME/Library/Application Support/Slack/Local Storage/leveldb"
+    )
+    for spath in "${slack_paths[@]}"; do
+        if [[ -d "$spath" ]]; then
+            SESSION_TOKENS_FOUND=$((SESSION_TOKENS_FOUND + 1))
+            SESSION_TOKENS_LIST+=("Slack session: $spath")
+        fi
+    done
+
+    # Telegram session
+    local telegram_paths=(
+        "$HOME/.local/share/TelegramDesktop"
+        "$HOME/Library/Application Support/Telegram Desktop"
+    )
+    for tpath in "${telegram_paths[@]}"; do
+        if [[ -d "$tpath" ]]; then
+            SESSION_TOKENS_FOUND=$((SESSION_TOKENS_FOUND + 1))
+            SESSION_TOKENS_LIST+=("Telegram session: $tpath")
+        fi
+    done
+
+    # Informational - these are common stealer targets
+    [[ "$SESSION_TOKENS_FOUND" -eq 0 ]]
+}
+
+# VPN/WiFi configs with embedded keys
+VPN_CONFIGS_FOUND=0
+declare -a VPN_CONFIGS_LIST=()
+
+check_vpn_wifi_configs() {
+    VPN_CONFIGS_FOUND=0
+    VPN_CONFIGS_LIST=()
+
+    # OpenVPN configs with embedded keys
+    while IFS= read -r ovpn; do
+        if grep -qE '<(key|cert|tls-auth)>' "$ovpn" 2>/dev/null; then
+            VPN_CONFIGS_FOUND=$((VPN_CONFIGS_FOUND + 1))
+            VPN_CONFIGS_LIST+=("OpenVPN (embedded key): $ovpn")
+        fi
+    done < <(find "$HOME" -maxdepth 4 -name "*.ovpn" \
+        -not -path "*/.cache/*" \
+        -not -path "*/.Trash/*" 2>/dev/null | head -10)
+
+    # WireGuard configs with private keys
+    local wg_paths=("/etc/wireguard" "$HOME/.config/wireguard" "$HOME/wireguard")
+    for wdir in "${wg_paths[@]}"; do
+        if [[ -d "$wdir" ]]; then
+            while IFS= read -r wgconf; do
+                if grep -qE 'PrivateKey\s*=' "$wgconf" 2>/dev/null; then
+                    VPN_CONFIGS_FOUND=$((VPN_CONFIGS_FOUND + 1))
+                    VPN_CONFIGS_LIST+=("WireGuard (private key): $wgconf")
+                fi
+            done < <(find "$wdir" -name "*.conf" 2>/dev/null | head -5)
+        fi
+    done
+
+    # Saved WiFi passwords (Linux NetworkManager)
+    if [[ "$OS_TYPE" == "linux" ]] && [[ -d "/etc/NetworkManager/system-connections" ]]; then
+        local wifi_count=0
+        wifi_count=$(find /etc/NetworkManager/system-connections -name "*.nmconnection" -readable 2>/dev/null | wc -l)
+        if [[ $wifi_count -gt 0 ]]; then
+            # Check if they contain plaintext passwords
+            local pw_count=0
+            while IFS= read -r nmfile; do
+                if grep -qE 'psk=' "$nmfile" 2>/dev/null; then
+                    pw_count=$((pw_count + 1))
+                fi
+            done < <(find /etc/NetworkManager/system-connections -name "*.nmconnection" -readable 2>/dev/null)
+            if [[ $pw_count -gt 0 ]]; then
+                VPN_CONFIGS_FOUND=$((VPN_CONFIGS_FOUND + pw_count))
+                VPN_CONFIGS_LIST+=("WiFi passwords readable: $pw_count networks in /etc/NetworkManager/")
+            fi
+        fi
+    fi
+
+    # FileZilla saved credentials
+    local filezilla_paths=(
+        "$HOME/.config/filezilla/sitemanager.xml"
+        "$HOME/.filezilla/sitemanager.xml"
+        "$HOME/Library/Application Support/FileZilla/sitemanager.xml"
+    )
+    for fz in "${filezilla_paths[@]}"; do
+        if [[ -f "$fz" ]]; then
+            if grep -qE '<Pass' "$fz" 2>/dev/null; then
+                VPN_CONFIGS_FOUND=$((VPN_CONFIGS_FOUND + 1))
+                VPN_CONFIGS_LIST+=("FileZilla saved passwords: $fz")
+            fi
+        fi
+    done
+
+    [[ "$VPN_CONFIGS_FOUND" -eq 0 ]]
+}
+
+# GPG key protection check
+GPG_WEAK_KEYS=0
+declare -a GPG_WEAK_LIST=()
+
+check_gpg_protection() {
+    GPG_WEAK_KEYS=0
+    GPG_WEAK_LIST=()
+
+    if ! command -v gpg &>/dev/null; then
+        return 0
+    fi
+
+    # Check if GPG private keys exist
+    local key_count
+    key_count=$(gpg --list-secret-keys 2>/dev/null | grep -c "^sec" || echo "0")
+    if [[ "$key_count" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Check GPG directory permissions
+    if [[ -d "$HOME/.gnupg" ]]; then
+        local perms
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            perms=$(stat -c %a "$HOME/.gnupg" 2>/dev/null)
+        else
+            perms=$(stat -f %Lp "$HOME/.gnupg" 2>/dev/null)
+        fi
+        if [[ -n "$perms" ]] && [[ "$perms" != "700" ]] && [[ "$perms" != "600" ]]; then
+            GPG_WEAK_KEYS=$((GPG_WEAK_KEYS + 1))
+            GPG_WEAK_LIST+=("~/.gnupg bad permissions (mode: $perms, should be 700)")
+        fi
+    fi
+
+    return 0
+}
+
+# Password manager vault file permissions
+VAULT_ISSUES=0
+declare -a VAULT_ISSUES_LIST=()
+
+check_password_vault_files() {
+    VAULT_ISSUES=0
+    VAULT_ISSUES_LIST=()
+
+    # KeePass .kdbx files
+    while IFS= read -r kdbx; do
+        local perms
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            perms=$(stat -c %a "$kdbx" 2>/dev/null)
+        else
+            perms=$(stat -f %Lp "$kdbx" 2>/dev/null)
+        fi
+        if [[ -n "$perms" ]] && [[ "$perms" != "600" ]] && [[ "$perms" != "400" ]] && [[ "$perms" != "700" ]]; then
+            VAULT_ISSUES=$((VAULT_ISSUES + 1))
+            VAULT_ISSUES_LIST+=("$(basename "$kdbx") (mode: $perms): $kdbx")
+        fi
+    done < <(find "$HOME" -maxdepth 4 -name "*.kdbx" \
+        -not -path "*/.Trash/*" \
+        -not -path "*/.cache/*" 2>/dev/null | head -10)
+
+    [[ "$VAULT_ISSUES" -eq 0 ]]
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1863,6 +2270,72 @@ print_findings() {
             shown=$((shown + 1))
             [[ $shown -ge 10 ]] && echo -e "  ${DIM}... and $((${#EXPOSED_ENV_LIST[@]} - 10)) more${RESET}" && break
         done
+    fi
+
+    # Crypto wallets (informational warning)
+    if [[ ${#CRYPTO_WALLETS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${YELLOW}${BOLD}Crypto wallets found (infostealer targets):${RESET}"
+        for wallet in "${CRYPTO_WALLETS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $wallet"
+        done
+        echo -e "  ${YELLOW}Ensure wallets are encrypted & use hardware wallets for large amounts${RESET}"
+    fi
+
+    # Dev tokens
+    if [[ ${#DEV_TOKENS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Exposed dev tokens:${RESET}"
+        for token in "${DEV_TOKENS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $token"
+        done
+        echo -e "  ${YELLOW}Rotate tokens and use credential helpers or env vars${RESET}"
+    fi
+
+    # Session tokens (informational)
+    if [[ ${#SESSION_TOKENS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${YELLOW}${BOLD}App sessions found (infostealer targets):${RESET}"
+        for sess in "${SESSION_TOKENS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $sess"
+        done
+        echo -e "  ${YELLOW}Enable 2FA on these accounts. Stealers can hijack active sessions${RESET}"
+    fi
+
+    # VPN/WiFi configs
+    if [[ ${#VPN_CONFIGS_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}VPN/WiFi configs with credentials:${RESET}"
+        for vpn in "${VPN_CONFIGS_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $vpn"
+        done
+        echo -e "  ${YELLOW}Use file-based key refs instead of embedded keys. chmod 600 configs${RESET}"
+    fi
+
+    # GPG weak permissions
+    if [[ ${#GPG_WEAK_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}GPG key issues:${RESET}"
+        for gpgissue in "${GPG_WEAK_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $gpgissue"
+        done
+        echo -e "  ${YELLOW}Run: chmod 700 ~/.gnupg${RESET}"
+    fi
+
+    # Password vault issues
+    if [[ ${#VAULT_ISSUES_LIST[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Password vault files with bad permissions:${RESET}"
+        for vault in "${VAULT_ISSUES_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $vault"
+        done
+        echo -e "  ${YELLOW}Run: chmod 600 <vault.kdbx>${RESET}"
     fi
 
     # Skipped checks that need sudo
