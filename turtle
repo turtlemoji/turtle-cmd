@@ -1636,13 +1636,40 @@ main() {
             update)
                 local self
                 self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-                echo "Updating turtle..."
-                curl -fsSL "https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle" -o "$self.tmp"
+                local repo="https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle"
+
+                # Check we can write to the install location
+                if [[ ! -w "$self" ]]; then
+                    echo "Error: No write permission to $self"
+                    echo "Try: sudo turtle update"
+                    exit 1
+                fi
+
+                echo "Checking for updates..."
+
+                # Download to temp file
+                local tmp
+                tmp="$(mktemp)"
+                if ! curl -fsSL "$repo" -o "$tmp" 2>/dev/null; then
+                    rm -f "$tmp"
+                    echo "Error: Failed to download update"
+                    exit 1
+                fi
+
+                # Compare versions
                 local new_ver
-                new_ver=$(grep '^VERSION=' "$self.tmp" | cut -d'"' -f2)
-                mv "$self.tmp" "$self"
+                new_ver=$(grep '^VERSION=' "$tmp" | cut -d'"' -f2)
+
+                if [[ "$new_ver" == "$VERSION" ]]; then
+                    rm -f "$tmp"
+                    echo "🐢 Already up to date (v${VERSION})"
+                    exit 0
+                fi
+
+                # Replace
+                mv "$tmp" "$self"
                 chmod +x "$self"
-                echo "🐢 Updated to v${new_ver}"
+                echo "🐢 Updated v${VERSION} → v${new_ver}"
                 exit 0
                 ;;
             -h|--help)
