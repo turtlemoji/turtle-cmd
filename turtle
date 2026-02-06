@@ -836,21 +836,55 @@ check_secrets_in_history() {
     local patterns='(API[_-]?KEY|SECRET[_-]?KEY|AWS_SECRET_ACCESS_KEY|PRIVATE[_-]?KEY)[=:]["\x27]?[A-Za-z0-9+/=_-]{16,}'
     # Also match actual key material
     local key_patterns='-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
+    # Crypto wallet patterns:
+    #   Ethereum hex private key (0x + 64 hex chars)
+    #   Bitcoin WIF (51-52 base58 chars starting with 5, K, or L) - no ^ anchor for zsh timestamps
+    #   Solana private key (base58, 87-88 chars)
+    #   Crypto CLI flags with key values
+    local crypto_patterns='(0x[0-9a-fA-F]{64}|[^a-zA-Z0-9][5KL][1-9A-HJ-NP-Za-km-z]{50,51}[^a-zA-Z0-9]?|(--private-key|--seed|--mnemonic|--secret-key)[= ]["\x27]?[A-Za-z0-9])'
+    # BIP39 seed phrases: 11+ lowercase words in a row (mnemonic)
+    # Threshold at 11 to catch zsh line-wrapping that splits 12-word phrases
+    local seed_pattern='([a-z]{3,8} ){10,23}[a-z]{3,8}'
 
     SECRETS_IN_HISTORY=0
     SECRETS_FOUND=()
     for hfile in "${history_files[@]}"; do
         if [[ -f "$hfile" ]]; then
-            while IFS= read -r line; do
+            while IFS= read -r match; do
+                # Split "linenum:content" from grep -n
+                local lineno="${match%%:*}"
+                local line="${match#*:}"
                 # Skip common safe commands that match loosely
                 [[ "$line" =~ (sudo passwd|ssh-keygen|gpg |man |--help|--password-stdin) ]] && continue
                 [[ "$line" =~ (curl.*-u|wget|apt|pip|npm|brew) ]] && continue
                 # Redact the secret value, keep the key name
                 local redacted
-                redacted=$(echo "$line" | sed -E 's/([=:]["'"'"']?)[A-Za-z0-9+/=_-]{16,}/\1*****/g' | cut -c1-60)
-                SECRETS_FOUND+=("$(basename "$hfile"): $redacted")
+                redacted=$(echo "$line" | sed -E \
+                    -e 's/0x[0-9a-fA-F]{64}/0x*****/g' \
+                    -e 's/[5KL][1-9A-HJ-NP-Za-km-z]{50,51}/*****[WIF]/g' \
+                    -e 's/([=:]["'"'"']?)[A-Za-z0-9+/=_-]{16,}/\1*****/g' \
+                    | cut -c1-80)
+                # Strip zsh timestamp prefix for cleaner output
+                redacted=$(echo "$redacted" | sed -E 's/^: [0-9]+:[0-9]+;//')
+                SECRETS_FOUND+=("$(basename "$hfile"):$lineno: $redacted")
                 SECRETS_IN_HISTORY=$((SECRETS_IN_HISTORY + 1))
-            done < <(grep -E "$patterns|$key_patterns" "$hfile" 2>/dev/null | head -10)
+            done < <(grep -nE "$patterns|$key_patterns|$crypto_patterns" "$hfile" 2>/dev/null | head -10)
+
+            # Separate check for seed phrases (11+ lowercase words)
+            while IFS= read -r match; do
+                local lineno="${match%%:*}"
+                local line="${match#*:}"
+                [[ "$line" =~ (echo|man |cat |grep |--help) ]] && continue
+                # Strip zsh timestamp prefix, then show first word + count
+                local clean
+                clean=$(echo "$line" | sed -E 's/^: [0-9]+:[0-9]+;//')
+                local word_count
+                word_count=$(echo "$clean" | wc -w | tr -d ' ')
+                local first_word
+                first_word=$(echo "$clean" | awk '{print $1}')
+                SECRETS_FOUND+=("$(basename "$hfile"):$lineno: ${first_word} ... (${word_count} words) [seed phrase]")
+                SECRETS_IN_HISTORY=$((SECRETS_IN_HISTORY + 1))
+            done < <(grep -nE "$seed_pattern" "$hfile" 2>/dev/null | head -5)
         fi
     done
     [[ "$SECRETS_IN_HISTORY" -eq 0 ]]
