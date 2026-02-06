@@ -169,6 +169,10 @@ stop_animation() {
 
 TOTAL_SCORE=0
 MAX_SCORE=0
+CHECKS_PASSED=0
+CHECKS_FAILED=0
+CHECKS_SKIPPED=0
+SCAN_START=0
 declare -a CHECK_RESULTS=()
 declare -a SKIPPED_SUDO=()
 
@@ -203,6 +207,14 @@ record_check() {
     local max_points="$5"
 
     CHECK_RESULTS+=("$category|$name|$passed|$points|$max_points")
+
+    if [[ "$passed" == "1" ]]; then
+        CHECKS_PASSED=$((CHECKS_PASSED + 1))
+    elif [[ "$passed" == "skip" ]]; then
+        CHECKS_SKIPPED=$((CHECKS_SKIPPED + 1))
+    else
+        CHECKS_FAILED=$((CHECKS_FAILED + 1))
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -241,22 +253,29 @@ skip_check() {
 # SYSTEM SECURITY CHECKS (max ~300 pts)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+FIREWALL_NEEDS_SUDO=false
+
 check_firewall() {
     if [[ "$OS_TYPE" == "linux" ]]; then
-        # Check ufw first, then iptables
+        # Check ufw first, then iptables/nftables
         if command -v ufw &>/dev/null; then
-            ufw status 2>/dev/null | grep -q "Status: active"
-        elif command -v iptables &>/dev/null; then
-            # Check if iptables has any non-default rules
-            [[ $(iptables -L -n 2>/dev/null | wc -l) -gt 8 ]]
+            # ufw needs root to check status
+            if is_root; then
+                ufw status 2>/dev/null | grep -q "Status: active"
+            else
+                # Check if ufw service is running without root
+                systemctl is-active ufw &>/dev/null || \
+                    systemctl is-active ufw.service &>/dev/null || \
+                    { FIREWALL_NEEDS_SUDO=true; return 1; }
+            fi
         elif command -v nft &>/dev/null; then
-            # Check nftables
             [[ $(nft list ruleset 2>/dev/null | wc -l) -gt 0 ]]
+        elif command -v iptables &>/dev/null; then
+            [[ $(iptables -L -n 2>/dev/null | wc -l) -gt 8 ]]
         else
             return 1
         fi
     elif [[ "$OS_TYPE" == "macos" ]]; then
-        # Check macOS application firewall
         /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q "enabled"
     else
         return 1
@@ -361,6 +380,14 @@ run_system_checks() {
     local category="SYSTEM SECURITY"
 
     run_check "$category" "Firewall enabled" 100 "check_firewall" || true
+    if [[ "$FIREWALL_NEEDS_SUDO" == "true" ]]; then
+        # Undo the failed check and replace with skip
+        unset 'CHECK_RESULTS[-1]'
+        CHECKS_FAILED=$((CHECKS_FAILED - 1))
+        MAX_SCORE=$((MAX_SCORE - 100))
+        skip_check "$category" "Firewall check" "needs sudo"
+        SKIPPED_SUDO+=("Firewall check (ufw needs root)")
+    fi
     run_check "$category" "Auto-updates configured" 50 "check_auto_updates" || true
 
     if [[ "$OS_TYPE" == "macos" ]]; then
@@ -637,10 +664,16 @@ ENV_FILES_COUNT=0
 check_env_files() {
     EXPOSED_ENV_LIST=()
     while IFS= read -r envfile; do
-        # Skip templates and examples - they don't contain real secrets
+        # Skip templates and examples
         [[ "$envfile" == *.example ]] && continue
         [[ "$envfile" == *.sample ]] && continue
         [[ "$envfile" == *.template ]] && continue
+        # Skip test fixtures and IDE internals
+        [[ "$envfile" == */testdata/* ]] && continue
+        [[ "$envfile" == */test/* ]] && continue
+        [[ "$envfile" == */fixtures/* ]] && continue
+        [[ "$envfile" == */.vscode/* ]] && continue
+        [[ "$envfile" == */.idea/* ]] && continue
         EXPOSED_ENV_LIST+=("$envfile")
     done < <(find "$HOME" \
         -path "*/node_modules" -prune -o \
@@ -649,7 +682,7 @@ check_env_files() {
         -path "*/.cache" -prune -o \
         -path "*/vendor" -prune -o \
         -path "*/.local/share" -prune -o \
-        \( -name ".env" -o -name "*.env" -o -name ".env.*" \) -print 2>/dev/null)
+        \( -name ".env" -o -name ".env.*" \) -print 2>/dev/null)
     ENV_FILES_COUNT=${#EXPOSED_ENV_LIST[@]}
     [[ "$ENV_FILES_COUNT" -eq 0 ]]
 }
@@ -1308,6 +1341,152 @@ run_hardening_checks() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# BEST PRACTICES CHECKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+check_password_manager() {
+    # Check for common password managers
+    if command -v 1password &>/dev/null || command -v op &>/dev/null; then
+        return 0  # 1Password
+    elif command -v bw &>/dev/null; then
+        return 0  # Bitwarden CLI
+    elif command -v keepassxc-cli &>/dev/null || command -v keepassxc &>/dev/null; then
+        return 0  # KeePassXC
+    elif command -v pass &>/dev/null; then
+        return 0  # pass (Unix password store)
+    elif command -v lpass &>/dev/null; then
+        return 0  # LastPass CLI
+    fi
+
+    # Check for GUI password managers
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        if command -v seahorse &>/dev/null || command -v gnome-keyring &>/dev/null; then
+            return 0  # GNOME Keyring
+        fi
+        # Check for flatpak/snap password managers
+        flatpak list 2>/dev/null | grep -qi "bitwarden\|1password\|keepass" && return 0
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS Keychain is always available
+        if [[ -d "/Applications/1Password.app" ]] || \
+           [[ -d "/Applications/Bitwarden.app" ]] || \
+           [[ -d "/Applications/KeePassXC.app" ]]; then
+            return 0
+        fi
+        # macOS Keychain counts
+        return 0
+    fi
+
+    return 1
+}
+
+check_git_signing() {
+    # Check if git commit signing is configured
+    local signing
+    signing=$(git config --global commit.gpgsign 2>/dev/null || echo "false")
+    [[ "$signing" == "true" ]]
+}
+
+check_pending_security_updates() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        if command -v apt &>/dev/null; then
+            # Debian/Ubuntu - check for security updates
+            local sec_updates
+            sec_updates=$(apt list --upgradable 2>/dev/null | grep -ci "security" || echo "0")
+            [[ "$sec_updates" -lt 5 ]]
+        elif command -v dnf &>/dev/null; then
+            local sec_updates
+            sec_updates=$(dnf check-update --security 2>/dev/null | grep -c "\.x86_64\|\.noarch\|\.aarch64" || echo "0")
+            [[ "$sec_updates" -lt 5 ]]
+        elif command -v pacman &>/dev/null; then
+            # Arch - check if system is up to date
+            local pending
+            pending=$(pacman -Qu 2>/dev/null | wc -l | tr -d ' ')
+            [[ "$pending" -lt 20 ]]
+        else
+            return 0
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        local pending
+        pending=$(softwareupdate -l 2>&1 | grep -c "recommended" || echo "0")
+        [[ "$pending" -lt 3 ]]
+    else
+        return 0
+    fi
+}
+
+check_swap_encryption() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check if swap is encrypted or doesn't exist
+        local swap_devices
+        swap_devices=$(swapon --show=NAME --noheadings 2>/dev/null)
+        if [[ -z "$swap_devices" ]]; then
+            return 0  # No swap, no problem
+        fi
+        # Check if swap is on an encrypted device
+        while IFS= read -r swap; do
+            if [[ "$swap" == /dev/mapper/* ]] || [[ "$swap" == /dev/dm-* ]]; then
+                continue  # Encrypted (dm-crypt/LUKS)
+            fi
+            # Check if it's a zram device (compressed RAM, not on disk)
+            if [[ "$swap" == /dev/zram* ]]; then
+                continue  # zram is fine
+            fi
+            # Unencrypted swap on disk
+            return 1
+        done <<< "$swap_devices"
+        return 0
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS encrypts swap by default when FileVault is on
+        if fdesetup status 2>/dev/null | grep -q "On"; then
+            return 0
+        fi
+        # Check sysctl for encrypted swap
+        sysctl vm.swapusage 2>/dev/null | grep -q "encrypted" && return 0
+        return 1
+    fi
+    return 0
+}
+
+check_kernel_up_to_date() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        local running installed
+        running=$(uname -r)
+        # Check what kernel is installed vs running
+        if command -v rpm &>/dev/null; then
+            installed=$(rpm -q kernel --last 2>/dev/null | head -1 | awk '{print $1}' | sed 's/kernel-//')
+        elif [[ -d /boot ]]; then
+            installed=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
+        else
+            return 0
+        fi
+        # If we can determine the installed kernel, compare
+        if [[ -n "$installed" ]]; then
+            [[ "$running" == "$installed" ]]
+        else
+            return 0
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS kernel is updated with system updates
+        # Check if there are pending system updates
+        local pending
+        pending=$(softwareupdate -l 2>&1 | grep -ci "restart" || echo "0")
+        [[ "$pending" -eq 0 ]]
+    else
+        return 0
+    fi
+}
+
+run_bestpractice_checks() {
+    local category="BEST PRACTICES"
+
+    run_check "$category" "Password manager installed" 50 "check_password_manager" || true
+    run_check "$category" "Git commit signing enabled" 25 "check_git_signing" || true
+    run_check "$category" "Security updates applied" 75 "check_pending_security_updates" || true
+    run_check "$category" "Swap encrypted" 50 "check_swap_encryption" || true
+    run_check "$category" "Kernel up to date" 50 "check_kernel_up_to_date" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # OUTPUT & SCORING
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1352,7 +1531,7 @@ print_results() {
         fi
 
         # Print check result
-        local status_icon points_display
+        local status_icon points_display severity=""
         if [[ "$passed" == "1" ]]; then
             status_icon="${GREEN}✓${RESET}"
             points_display="${GREEN}+${points}${RESET}"
@@ -1360,12 +1539,18 @@ print_results() {
             status_icon="${YELLOW}○${RESET}"
             points_display="${DIM}skip${RESET}"
         elif [[ "$points" == -* ]]; then
-            # Negative points - bad finding
             status_icon="${RED}✗${RESET}"
             points_display="${RED}${points}${RESET}"
+            severity=" ${RED}!!${RESET}"
         else
             status_icon="${RED}✗${RESET}"
-            points_display="${RED}+0${RESET}"
+            # Mark high-value failures
+            if [[ "$max_points" -ge 75 ]]; then
+                points_display="${RED}+0${RESET}"
+                severity=" ${RED}!!${RESET}"
+            else
+                points_display="${RED}+0${RESET}"
+            fi
         fi
 
         # Calculate padding for alignment
@@ -1375,7 +1560,7 @@ print_results() {
         local dots
         dots=$(printf '.%.0s' $(seq 1 $padding))
 
-        printf "  %b %s ${DIM}%s${RESET} %b\n" "$status_icon" "$name" "$dots" "$points_display"
+        printf "  %b %s ${DIM}%s${RESET} %b%b\n" "$status_icon" "$name" "$dots" "$points_display" "$severity"
     done
 }
 
@@ -1465,8 +1650,10 @@ print_score() {
         echo -e "${GREEN}Great job! Keep your shell strong!${RESET}"
     fi
 
+    # Summary line
+    local scan_duration=$((SECONDS - SCAN_START))
     echo ""
-    echo -e "${DIM}Higher score = more secure 🐢${RESET}"
+    echo -e "${DIM}${GREEN}$CHECKS_PASSED passed${RESET}${DIM}, ${RED}$CHECKS_FAILED failed${RESET}${DIM}, ${YELLOW}$CHECKS_SKIPPED skipped${RESET}${DIM} in ${scan_duration}s 🐢${RESET}"
     echo ""
 }
 
@@ -1712,6 +1899,8 @@ main() {
     # Suppress animation for JSON output
     [[ "$json_output" == "true" ]] && quiet=true
 
+    SCAN_START=$SECONDS
+
     # Start animation or print static header
     if [[ "$quiet" != "true" ]]; then
         start_animation
@@ -1728,6 +1917,7 @@ main() {
     run_network_checks
     run_services_checks
     run_hardening_checks
+    run_bestpractice_checks
 
     # Stop animation
     [[ "$quiet" != "true" ]] && stop_animation
