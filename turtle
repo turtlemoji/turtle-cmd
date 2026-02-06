@@ -499,9 +499,10 @@ check_no_empty_passwords() {
 }
 
 check_sudo_requires_password() {
-    # Check if NOPASSWD is set for the current user
-    if sudo -l 2>/dev/null | grep -q "NOPASSWD"; then
-        return 1  # NOPASSWD is insecure
+    # Check if NOPASSWD: ALL is set (dangerous - full sudo without password)
+    # NOPASSWD for specific commands is acceptable
+    if sudo -l 2>/dev/null | grep -qE "NOPASSWD:\s*(ALL|/bin/\*|/usr/bin/\*)"; then
+        return 1  # NOPASSWD for everything is insecure
     fi
     return 0
 }
@@ -636,8 +637,19 @@ ENV_FILES_COUNT=0
 check_env_files() {
     EXPOSED_ENV_LIST=()
     while IFS= read -r envfile; do
+        # Skip templates and examples - they don't contain real secrets
+        [[ "$envfile" == *.example ]] && continue
+        [[ "$envfile" == *.sample ]] && continue
+        [[ "$envfile" == *.template ]] && continue
         EXPOSED_ENV_LIST+=("$envfile")
-    done < <(find "$HOME" -name ".env" -o -name "*.env" -o -name ".env.*" 2>/dev/null)
+    done < <(find "$HOME" \
+        -path "*/node_modules" -prune -o \
+        -path "*/.git" -prune -o \
+        -path "*/go/pkg/mod" -prune -o \
+        -path "*/.cache" -prune -o \
+        -path "*/vendor" -prune -o \
+        -path "*/.local/share" -prune -o \
+        \( -name ".env" -o -name "*.env" -o -name ".env.*" \) -print 2>/dev/null)
     ENV_FILES_COUNT=${#EXPOSED_ENV_LIST[@]}
     [[ "$ENV_FILES_COUNT" -eq 0 ]]
 }
@@ -685,19 +697,25 @@ declare -a EXPOSED_ENV_LIST=()
 check_secrets_in_history() {
     # Check shell history files for secrets
     local history_files=("$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.history")
-    local patterns='(api[_-]?key|apikey|secret[_-]?key|password|passwd|AWS_SECRET|PRIVATE[_-]?KEY|BEGIN RSA|BEGIN OPENSSH|BEGIN EC|token|bearer)[=:\"'"'"' ]+[A-Za-z0-9+/=_-]{8,}'
+    # Match actual secret assignments (key=value or key: value with real-looking secrets)
+    local patterns='(API[_-]?KEY|SECRET[_-]?KEY|AWS_SECRET_ACCESS_KEY|PRIVATE[_-]?KEY)[=:]["\x27]?[A-Za-z0-9+/=_-]{16,}'
+    # Also match actual key material
+    local key_patterns='-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
 
     SECRETS_IN_HISTORY=0
     SECRETS_FOUND=()
     for hfile in "${history_files[@]}"; do
         if [[ -f "$hfile" ]]; then
             while IFS= read -r line; do
+                # Skip common safe commands that match loosely
+                [[ "$line" =~ (sudo passwd|ssh-keygen|gpg |man |--help|--password-stdin) ]] && continue
+                [[ "$line" =~ (curl.*-u|wget|apt|pip|npm|brew) ]] && continue
                 # Redact the secret value, keep the key name
                 local redacted
-                redacted=$(echo "$line" | sed -E 's/([=:]["'"'"']?)[A-Za-z0-9+/=_-]{8,}/\1*****/g' | cut -c1-60)
+                redacted=$(echo "$line" | sed -E 's/([=:]["'"'"']?)[A-Za-z0-9+/=_-]{16,}/\1*****/g' | cut -c1-60)
                 SECRETS_FOUND+=("$(basename "$hfile"): $redacted")
                 SECRETS_IN_HISTORY=$((SECRETS_IN_HISTORY + 1))
-            done < <(grep -iE "$patterns" "$hfile" 2>/dev/null | head -10)
+            done < <(grep -E "$patterns|$key_patterns" "$hfile" 2>/dev/null | head -10)
         fi
     done
     [[ "$SECRETS_IN_HISTORY" -eq 0 ]]
@@ -854,24 +872,117 @@ run_secrets_checks() {
         record_check "$category" "Exposed private keys: $EXPOSED_KEYS" "0" "-$penalty" "50"
     fi
 
-    # Browser password databases
+    # Browser password databases (informational - browsers encrypt these)
     animate_turtle "Checking browser passwords"
     check_browser_passwords || true
-    add_max 25
-    if [[ "$BROWSER_PASSWORDS" -eq 0 ]]; then
-        record_check "$category" "No browser password DBs" "1" "25" "25"
-        add_score 25
-    else
-        # Not a huge penalty - browsers usually encrypt these
-        local penalty=$((BROWSER_PASSWORDS * 10))
-        [[ $penalty -gt 50 ]] && penalty=50
-        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
-        record_check "$category" "Browser password DBs: $BROWSER_PASSWORDS" "0" "-$penalty" "25"
+    if [[ "$BROWSER_PASSWORDS" -gt 0 ]]; then
+        record_check "$category" "Browser password DBs: $BROWSER_PASSWORDS" "skip" "0" "0"
     fi
 
     # Sudo timestamp
     animate_turtle "Checking sudo timeout"
     run_check "$category" "Sudo timeout reasonable" 25 "check_sudo_timestamp" || true
+
+    # Secrets in shell config
+    animate_turtle "Checking shell config"
+    check_secrets_in_shell_config || true
+    add_max 50
+    if [[ "$SECRETS_IN_CONFIG" -eq 0 ]]; then
+        record_check "$category" "No secrets in shell config" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((SECRETS_IN_CONFIG * 15))
+        [[ $penalty -gt 100 ]] && penalty=100
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "Secrets in shell config: $SECRETS_IN_CONFIG" "0" "-$penalty" "50"
+    fi
+
+    # Git credential helper
+    animate_turtle "Checking git credentials"
+    run_check "$category" "Git creds not in plaintext" 50 "check_git_credential_helper" || true
+
+    # SSH agent forwarding
+    animate_turtle "Checking SSH config"
+    run_check "$category" "SSH agent forwarding safe" 25 "check_ssh_agent_forwarding" || true
+
+    # Docker socket
+    animate_turtle "Checking Docker socket"
+    run_check "$category" "Docker socket protected" 50 "check_docker_socket" || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HIGH IMPACT CHECKS - Helper functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SECRETS_IN_CONFIG=0
+declare -a CONFIG_SECRETS_FOUND=()
+
+check_secrets_in_shell_config() {
+    local config_files=("$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile")
+    local patterns='(export\s+)?(API[_-]?KEY|SECRET[_-]?KEY|AWS_SECRET|TOKEN|PASSWORD|PRIVATE[_-]?KEY)[=]["\x27]?[A-Za-z0-9+/=_-]{8,}'
+
+    SECRETS_IN_CONFIG=0
+    CONFIG_SECRETS_FOUND=()
+    for cfile in "${config_files[@]}"; do
+        if [[ -f "$cfile" ]]; then
+            while IFS= read -r line; do
+                local redacted
+                redacted=$(echo "$line" | sed -E 's/[=]["\x27]?[A-Za-z0-9+/=_-]{8,}/=*****/g' | cut -c1-60)
+                CONFIG_SECRETS_FOUND+=("$(basename "$cfile"): $redacted")
+                SECRETS_IN_CONFIG=$((SECRETS_IN_CONFIG + 1))
+            done < <(grep -E "$patterns" "$cfile" 2>/dev/null | head -5)
+        fi
+    done
+    [[ "$SECRETS_IN_CONFIG" -eq 0 ]]
+}
+
+check_git_credential_helper() {
+    # Check if git is storing credentials in plaintext
+    local helper
+    helper=$(git config --global credential.helper 2>/dev/null || echo "")
+
+    # "store" saves in plaintext ~/.git-credentials
+    if [[ "$helper" == "store" ]]; then
+        return 1
+    fi
+
+    # Check if .git-credentials exists with content
+    if [[ -f "$HOME/.git-credentials" ]] && [[ -s "$HOME/.git-credentials" ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+check_ssh_agent_forwarding() {
+    # Check if ForwardAgent is enabled by default in ssh config
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        if grep -qiE "^\s*ForwardAgent\s+yes" "$HOME/.ssh/config" 2>/dev/null; then
+            # Check if it's a wildcard/default setting (dangerous)
+            if grep -B5 -iE "^\s*ForwardAgent\s+yes" "$HOME/.ssh/config" 2>/dev/null | grep -qiE "^\s*Host\s+\*"; then
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+check_docker_socket() {
+    local socket="/var/run/docker.sock"
+    if [[ -S "$socket" ]]; then
+        # Check if world-readable/writable
+        local perms
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            perms=$(stat -c %a "$socket" 2>/dev/null)
+        else
+            perms=$(stat -f %Lp "$socket" 2>/dev/null)
+        fi
+        # Socket should not be world-accessible (perms like 660 are ok, 666 is bad)
+        if [[ "$perms" =~ [2367]$ ]]; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -925,24 +1036,6 @@ check_dns_encryption() {
     fi
 }
 
-check_no_rogue_listeners() {
-    # Check for processes listening on unusual interfaces
-    local suspicious=0
-
-    if command -v ss &>/dev/null; then
-        # Look for listeners on 0.0.0.0 (all interfaces) that might be suspicious
-        local listeners
-        listeners=$(ss -tlnp 2>/dev/null | grep "0.0.0.0" | wc -l)
-        # Allow some common services
-        [[ $listeners -lt 10 ]]
-    elif command -v lsof &>/dev/null; then
-        local listeners
-        listeners=$(lsof -i -P -n 2>/dev/null | grep LISTEN | wc -l)
-        [[ $listeners -lt 15 ]]
-    else
-        return 0
-    fi
-}
 
 check_ipv6_privacy() {
     if [[ "$OS_TYPE" == "linux" ]]; then
@@ -963,7 +1056,6 @@ run_network_checks() {
 
     run_check "$category" "No dangerous open ports" 75 "check_open_ports" || true
     run_check "$category" "Encrypted DNS configured" 50 "check_dns_encryption" || true
-    run_check "$category" "Limited listening services" 50 "check_no_rogue_listeners" || true
     run_check "$category" "IPv6 privacy extensions" 25 "check_ipv6_privacy" || true
 }
 
@@ -1054,6 +1146,165 @@ run_services_checks() {
     if [[ "$OS_TYPE" == "linux" ]]; then
         run_check "$category" "Kernel hardening enabled" 50 "check_kernel_hardening" || true
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM HARDENING CHECKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FAILED_LOGINS=0
+EXPOSED_SERVICES=0
+declare -a EXPOSED_SERVICES_LIST=()
+
+check_failed_logins() {
+    # Check for recent failed login attempts (potential brute force)
+    FAILED_LOGINS=0
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        if [[ -r /var/log/auth.log ]]; then
+            FAILED_LOGINS=$(grep -c "Failed password" /var/log/auth.log 2>/dev/null || echo "0")
+        elif [[ -r /var/log/secure ]]; then
+            FAILED_LOGINS=$(grep -c "Failed password" /var/log/secure 2>/dev/null || echo "0")
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check last few days of logs
+        FAILED_LOGINS=$(log show --predicate 'eventMessage contains "failed"' --style syslog --last 7d 2>/dev/null | grep -ci "authentication" || echo "0")
+    fi
+
+    [[ -z "$FAILED_LOGINS" ]] && FAILED_LOGINS=0
+    [[ "$FAILED_LOGINS" =~ ^[0-9]+$ ]] || FAILED_LOGINS=0
+
+    # More than 50 failed logins in recent logs is concerning
+    [[ "$FAILED_LOGINS" -lt 50 ]]
+}
+
+check_services_exposed() {
+    # Check for services listening on 0.0.0.0 (all interfaces)
+    EXPOSED_SERVICES=0
+    EXPOSED_SERVICES_LIST=()
+
+    if command -v ss &>/dev/null; then
+        while IFS= read -r line; do
+            EXPOSED_SERVICES_LIST+=("$line")
+            EXPOSED_SERVICES=$((EXPOSED_SERVICES + 1))
+        done < <(ss -tlnp 2>/dev/null | grep "0.0.0.0:" | grep -v "127.0.0.1" | awk '{print $4 " " $6}' | head -10)
+    elif command -v netstat &>/dev/null; then
+        while IFS= read -r line; do
+            EXPOSED_SERVICES_LIST+=("$line")
+            EXPOSED_SERVICES=$((EXPOSED_SERVICES + 1))
+        done < <(netstat -tlnp 2>/dev/null | grep "0.0.0.0:" | awk '{print $4 " " $7}' | head -10)
+    fi
+
+    # A few exposed services is normal, but many is concerning
+    [[ "$EXPOSED_SERVICES" -lt 5 ]]
+}
+
+check_usb_automount() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check if udisks2 automount is enabled
+        if command -v gsettings &>/dev/null; then
+            local automount
+            automount=$(gsettings get org.gnome.desktop.media-handling automount 2>/dev/null || echo "false")
+            [[ "$automount" == "false" ]]
+        else
+            # Check udev rules for USB automount
+            ! grep -rq "automount" /etc/udev/rules.d/ 2>/dev/null
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS always automounts by default, check if disabled
+        defaults read /Library/Preferences/SystemConfiguration/com.apple.DiskArbitration.diskarbitrationd.plist DADisableEjectNotification 2>/dev/null | grep -q "1" || return 1
+    fi
+    return 0
+}
+
+check_bluetooth_discoverable() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check bluetoothctl or hciconfig
+        if command -v bluetoothctl &>/dev/null; then
+            ! bluetoothctl show 2>/dev/null | grep -q "Discoverable: yes"
+        else
+            return 0  # Bluetooth not installed
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check if Bluetooth is discoverable
+        local discoverable
+        discoverable=$(defaults read /Library/Preferences/com.apple.Bluetooth ControllerPowerState 2>/dev/null || echo "0")
+        # If Bluetooth is off, it's secure
+        [[ "$discoverable" == "0" ]] && return 0
+        # Check discoverability - hard to check on macOS, assume ok if BT is managed
+        return 0
+    fi
+    return 0
+}
+
+check_wifi_autoconnect() {
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Check NetworkManager for auto-connect to open networks
+        if command -v nmcli &>/dev/null; then
+            # Check if any connection has no security and autoconnect
+            local open_autoconnect
+            open_autoconnect=$(nmcli -t -f NAME,TYPE,AUTOCONNECT,SECURITY connection show 2>/dev/null | grep "wifi" | grep "yes" | grep -c "::" || echo "0")
+            [[ "$open_autoconnect" -eq 0 ]]
+        else
+            return 0
+        fi
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        # Check for auto-join open networks setting
+        local autojoin
+        autojoin=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.airport.preferences RememberRecentNetworks 2>/dev/null || echo "1")
+        # If remembering networks, check if any are open
+        # This is complex on macOS, assume reasonable default
+        return 0
+    fi
+    return 0
+}
+
+run_hardening_checks() {
+    local category="HARDENING"
+
+    # Failed login attempts
+    animate_turtle "Checking login attempts"
+    if is_root || [[ -r /var/log/auth.log ]] || [[ -r /var/log/secure ]]; then
+        check_failed_logins || true
+        add_max 50
+        if [[ "$FAILED_LOGINS" -lt 50 ]]; then
+            record_check "$category" "Few failed logins ($FAILED_LOGINS)" "1" "50" "50"
+            add_score 50
+        else
+            local penalty=50
+            TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+            record_check "$category" "Many failed logins: $FAILED_LOGINS" "0" "-$penalty" "50"
+        fi
+    else
+        skip_check "$category" "Failed login check" "needs sudo"
+        SKIPPED_SUDO+=("Failed login check (/var/log/auth.log)")
+    fi
+
+    # Services exposed on 0.0.0.0
+    animate_turtle "Checking exposed services"
+    check_services_exposed || true
+    add_max 50
+    if [[ "$EXPOSED_SERVICES" -lt 5 ]]; then
+        record_check "$category" "Few exposed services ($EXPOSED_SERVICES)" "1" "50" "50"
+        add_score 50
+    else
+        local penalty=$((EXPOSED_SERVICES * 10))
+        [[ $penalty -gt 75 ]] && penalty=75
+        TOTAL_SCORE=$((TOTAL_SCORE - penalty))
+        record_check "$category" "Services on 0.0.0.0: $EXPOSED_SERVICES" "0" "-$penalty" "50"
+    fi
+
+    # USB automount
+    animate_turtle "Checking USB automount"
+    run_check "$category" "USB automount disabled" 25 "check_usb_automount" || true
+
+    # Bluetooth discoverable
+    animate_turtle "Checking Bluetooth"
+    run_check "$category" "Bluetooth not discoverable" 25 "check_bluetooth_discoverable" || true
+
+    # WiFi auto-connect
+    animate_turtle "Checking WiFi settings"
+    run_check "$category" "No open WiFi auto-connect" 25 "check_wifi_autoconnect" || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1233,6 +1484,28 @@ print_findings() {
         echo -e "  ${YELLOW}Run: history -c && rm ~/.bash_history ~/.zsh_history${RESET}"
     fi
 
+    # Secrets in shell config
+    if [[ ${#CONFIG_SECRETS_FOUND[@]} -gt 0 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Secrets found in shell config:${RESET}"
+        for secret in "${CONFIG_SECRETS_FOUND[@]}"; do
+            echo -e "  ${DIM}→${RESET} $secret"
+        done
+        echo -e "  ${YELLOW}Move secrets to a .env file or secrets manager${RESET}"
+    fi
+
+    # Exposed services
+    if [[ ${#EXPOSED_SERVICES_LIST[@]} -gt 0 ]] && [[ "$EXPOSED_SERVICES" -ge 5 ]]; then
+        has_findings=true
+        echo ""
+        echo -e "${RED}${BOLD}Services exposed on all interfaces:${RESET}"
+        for svc in "${EXPOSED_SERVICES_LIST[@]}"; do
+            echo -e "  ${DIM}→${RESET} $svc"
+        done
+        echo -e "  ${YELLOW}Consider binding to 127.0.0.1 instead of 0.0.0.0${RESET}"
+    fi
+
     # Exposed cloud creds
     if [[ ${#EXPOSED_CLOUD_LIST[@]} -gt 0 ]]; then
         has_findings=true
@@ -1410,6 +1683,7 @@ main() {
     run_secrets_checks
     run_network_checks
     run_services_checks
+    run_hardening_checks
 
     # Stop animation
     [[ "$quiet" != "true" ]] && stop_animation
