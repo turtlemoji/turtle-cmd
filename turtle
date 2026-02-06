@@ -1597,6 +1597,7 @@ print_help() {
 Turtle Security Scanner v${VERSION}
 
 Usage: turtle [OPTIONS]
+       turtle update
 
 A portable security scanner that runs checks on your system and
 displays a gamified security score with a friendly turtle animation.
@@ -1608,8 +1609,12 @@ Options:
   -q, --quiet    Suppress animation (quieter output)
   --no-color     Disable colored output
 
+Commands:
+  update         Self-update to latest version
+
 Examples:
   turtle              Run full security scan
+  turtle update       Update to latest version
   turtle --json       Output results as JSON
   turtle --quiet      Run without animation
 
@@ -1628,6 +1633,18 @@ main() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            update)
+                local self
+                self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+                echo "Updating turtle..."
+                curl -fsSL "https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle" -o "$self.tmp"
+                local new_ver
+                new_ver=$(grep '^VERSION=' "$self.tmp" | cut -d'"' -f2)
+                mv "$self.tmp" "$self"
+                chmod +x "$self"
+                echo "🐢 Updated to v${new_ver}"
+                exit 0
+                ;;
             -h|--help)
                 print_help
                 exit 0
