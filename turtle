@@ -2657,6 +2657,166 @@ check_rootkit_indicators() {
         done <<< "$sus_suid"
     fi
 
+    # 7. LD_PRELOAD environment variable set (active hijacking)
+    if [[ -n "${LD_PRELOAD:-}" ]]; then
+        ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+        ROOTKIT_LIST+=("LD_PRELOAD is set: $LD_PRELOAD")
+    fi
+
+    # 8. Hidden files/dirs in /tmp and /dev (common rootkit staging)
+    local hidden_tmp
+    hidden_tmp=$(find /tmp /dev -maxdepth 2 -name ".*" -not -name "." -not -name ".." \
+        -not -name ".X11-unix" -not -name ".ICE-unix" -not -name ".font-unix" \
+        -not -name ".XIM-unix" -not -name ".Test-unix" \
+        -not -name ".X*-lock" -not -name ".docker*" -not -name ".buildx*" \
+        -not -name ".com.google*" \
+        -type f 2>/dev/null | head -5)
+    if [[ -n "$hidden_tmp" ]]; then
+        while IFS= read -r hfile; do
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Hidden file in /tmp or /dev: $hfile")
+        done <<< "$hidden_tmp"
+    fi
+
+    # 9. Promiscuous network interfaces (sniffing)
+    local promisc
+    promisc=$(ip link show 2>/dev/null | grep -i "PROMISC" | awk -F: '{print $2}' | tr -d ' ')
+    if [[ -n "$promisc" ]]; then
+        while IFS= read -r iface; do
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Promiscuous interface: $iface")
+        done <<< "$promisc"
+    fi
+
+    # 10. Deleted but still running binaries
+    local deleted_procs
+    deleted_procs=$(find /proc/*/exe -maxdepth 0 2>/dev/null | while read -r exelink; do
+        local target
+        target=$(readlink "$exelink" 2>/dev/null || echo "")
+        if [[ "$target" == *"(deleted)"* ]]; then
+            local pid="${exelink#/proc/}"
+            pid="${pid%/exe}"
+            local cmd
+            cmd=$(cat "/proc/$pid/comm" 2>/dev/null || echo "unknown")
+            echo "PID $pid ($cmd): $target"
+        fi
+    done)
+    if [[ -n "$deleted_procs" ]]; then
+        while IFS= read -r dp; do
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Deleted but running: $dp")
+        done <<< "$deleted_procs"
+    fi
+
+    # 11. Suspicious cron entries (reverse shells, wget|bash, curl|sh)
+    local cron_sus=""
+    for crondir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /var/spool/cron/crontabs; do
+        if [[ -d "$crondir" ]]; then
+            local matches
+            matches=$(grep -rlE '(bash -i|/dev/tcp/|nc -e|ncat -e|curl.*\|.*sh|wget.*\|.*bash|python.*socket|perl.*socket)' \
+                "$crondir" 2>/dev/null | head -3 || echo "")
+            [[ -n "$matches" ]] && cron_sus="${cron_sus}${matches}\n"
+        fi
+    done
+    # Also check user crontab
+    local user_cron
+    user_cron=$(crontab -l 2>/dev/null | grep -E '(bash -i|/dev/tcp/|nc -e|ncat -e|curl.*\|.*sh|wget.*\|.*bash)' | head -3 || echo "")
+    [[ -n "$user_cron" ]] && cron_sus="${cron_sus}user crontab: suspicious entry\n"
+    if [[ -n "$cron_sus" ]]; then
+        while IFS= read -r cline; do
+            [[ -z "$cline" ]] && continue
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Suspicious cron: $cline")
+        done <<< "$(echo -e "$cron_sus")"
+    fi
+
+    # 12. Known rootkit file paths
+    local rk_paths=(
+        "/usr/lib/libproc.a"
+        "/dev/.phalanx"
+        "/dev/.static"
+        "/usr/include/file.h"
+        "/usr/include/proc.h"
+        "/usr/lib/.libX11"
+        "/dev/ptyxx"
+        "/dev/ptyr"
+        "/usr/bin/.sniffer"
+        "/usr/lib/libsh.so"
+        "/usr/lib/libext-2.so"
+    )
+    for rkpath in "${rk_paths[@]}"; do
+        if [[ -e "$rkpath" ]]; then
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Known rootkit file: $rkpath")
+        fi
+    done
+
+    # 13. Suspicious .bashrc/.profile injections (LD_PRELOAD or PATH hijack)
+    for rcfile in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
+        if [[ -f "$rcfile" ]]; then
+            local sus_rc
+            sus_rc=$(grep -nE '(LD_PRELOAD=|LD_LIBRARY_PATH=.*(/tmp|/dev|/var/tmp)|PATH=.*/tmp)' \
+                "$rcfile" 2>/dev/null | head -3 || echo "")
+            # Also check for aliases hiding security commands (but allow common ls replacements)
+            local alias_sus
+            alias_sus=$(grep -nE 'alias (ps|netstat|ss|who|w|lsof|kill)=' \
+                "$rcfile" 2>/dev/null | head -3 || echo "")
+            [[ -n "$alias_sus" ]] && sus_rc="${sus_rc}${sus_rc:+$'\n'}${alias_sus}"
+            if [[ -n "$sus_rc" ]]; then
+                while IFS= read -r rcline; do
+                    ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                    ROOTKIT_LIST+=("Suspicious shell config ($rcfile): $rcline")
+                done <<< "$sus_rc"
+            fi
+        fi
+    done
+
+    # 14. Immutable flag on files in suspicious locations
+    if command -v lsattr &>/dev/null; then
+        local immutable
+        immutable=$(find /tmp /var/tmp /dev/shm -type f 2>/dev/null | head -20 | while read -r f; do
+            local attr
+            attr=$(lsattr "$f" 2>/dev/null || echo "")
+            if [[ "$attr" == *i* ]] && [[ "$attr" == ----i* || "$attr" == *i-* ]]; then
+                echo "$f"
+            fi
+        done)
+        if [[ -n "$immutable" ]]; then
+            while IFS= read -r imf; do
+                ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                ROOTKIT_LIST+=("Immutable file in temp dir: $imf")
+            done <<< "$immutable"
+        fi
+    fi
+
+    # 15. Unexpected listeners on common reverse shell ports
+    local revshell_ports="4444|4445|5555|6666|1337|31337|12345|9001"
+    local bad_listeners
+    if command -v ss &>/dev/null; then
+        bad_listeners=$(ss -tlnpH 2>/dev/null | grep -oE ':[0-9]+' | grep -oE '[0-9]+' | grep -E "^($revshell_ports)$" || echo "")
+    elif command -v netstat &>/dev/null; then
+        bad_listeners=$(netstat -tlnp 2>/dev/null | awk 'NR>2 {print $4}' | grep -oE '[0-9]+$' | grep -E "^($revshell_ports)$" || echo "")
+    fi
+    if [[ -n "$bad_listeners" ]]; then
+        while IFS= read -r port; do
+            [[ -z "$port" ]] && continue
+            ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+            ROOTKIT_LIST+=("Listener on reverse shell port: $port")
+        done <<< "$bad_listeners"
+    fi
+
+    # 16. Writable /etc/crontab or /etc/cron.d by non-root
+    for cronfile in /etc/crontab /etc/cron.d; do
+        if [[ -e "$cronfile" ]]; then
+            local cperms
+            cperms=$(stat -c %a "$cronfile" 2>/dev/null || echo "")
+            if [[ -n "$cperms" ]] && [[ "${cperms: -1}" != "0" ]] && [[ "${cperms: -1}" != "4" ]] && [[ "${cperms: -1}" != "5" ]]; then
+                ROOTKIT_INDICATORS=$((ROOTKIT_INDICATORS + 1))
+                ROOTKIT_LIST+=("World-writable cron: $cronfile ($cperms)")
+            fi
+        fi
+    done
+
     [[ "$ROOTKIT_INDICATORS" -eq 0 ]]
 }
 

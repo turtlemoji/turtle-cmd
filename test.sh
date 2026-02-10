@@ -435,9 +435,19 @@ if [[ "$OS_TYPE" == "linux" ]]; then
     # Verify it checks known paths
     rk_code=$(sed -n '/^check_rootkit_indicators/,/^}/p' "$TURTLE")
     assert_match "Checks ld.so.preload" "ld.so.preload" "$rk_code"
-    assert_match "Checks suspicious kernel modules" "diamorphine\|reptile" "$rk_code"
+    assert_match "Checks suspicious kernel modules" "diamorphine|reptile" "$rk_code"
     assert_match "Checks /dev/shm executables" "dev/shm" "$rk_code"
     assert_match "Checks process count" "proc_count|ps_count" "$rk_code"
+    assert_match "Checks LD_PRELOAD env" "LD_PRELOAD" "$rk_code"
+    assert_match "Checks hidden files in /tmp" "Hidden file" "$rk_code"
+    assert_match "Checks promiscuous interfaces" "PROMISC" "$rk_code"
+    assert_match "Checks deleted running binaries" "deleted" "$rk_code"
+    assert_match "Checks suspicious cron entries" "dev/tcp|nc -e|curl.*sh" "$rk_code"
+    assert_match "Checks known rootkit files" "libproc.a|phalanx" "$rk_code"
+    assert_match "Checks shell config injections" "bashrc.*profile|LD_PRELOAD=" "$rk_code"
+    assert_match "Checks immutable files" "lsattr" "$rk_code"
+    assert_match "Checks reverse shell ports" "4444|1337|31337" "$rk_code"
+    assert_match "Checks writable cron files" "crontab|cron.d" "$rk_code"
 else
     skip_test "Rootkit checks" "Linux only"
 fi
