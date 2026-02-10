@@ -46,22 +46,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test curl install
+      - name: Test curl | bash install
         run: |
-          # Serve repo files over HTTP locally
+          # Patch install.sh to use local server
+          sed "s|https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle|http://localhost:8888/turtle|" install.sh > install_local.sh
+
+          # Serve repo files over HTTP
           python3 -m http.server 8888 &
           SERVER_PID=$!
           sleep 1
 
-          # Override REPO to point at local server, install to temp dir
+          # Real curl | bash flow (same as README install command)
           DEST="$RUNNER_TEMP/turtle-test/turtle"
-          sed "s|https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle|http://localhost:8888/turtle|" install.sh \
-            | bash -s -- "$DEST"
+          curl -fsSL http://localhost:8888/install_local.sh | bash -s -- "$DEST"
 
           # Verify it installed and runs
           test -x "$DEST"
           "$DEST" --help | grep -q "Usage"
 
           kill $SERVER_PID
-          echo "curl install test passed"
+          echo "curl | bash install test passed"
         timeout-minutes: 3

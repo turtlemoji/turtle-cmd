@@ -234,11 +234,11 @@ assert_match "Update command exists" 'update\)' "$update_block"
 assert_match "Update checks write permission" 'write permission|-w' "$update_block"
 assert_match "Update compares versions" 'new_ver|VERSION' "$update_block"
 
-install_content=$(cat "$SCRIPT_DIR/install.sh")
-assert_match "install.sh has strict mode" "set -euo pipefail" "$install_content"
-assert_match "install.sh curls the script" "curl" "$install_content"
-assert_match "install.sh sets +x" "chmod" "$install_content"
-assert_match "install.sh handles PATH" "PATH" "$install_content"
+install_file="$SCRIPT_DIR/install.sh"
+assert_match "install.sh has strict mode" "set -euo pipefail" "$(grep 'pipefail' "$install_file")"
+assert_match "install.sh curls the script" "curl" "$(grep 'curl' "$install_file")"
+assert_match "install.sh sets +x" "chmod" "$(grep 'chmod' "$install_file")"
+assert_match "install.sh handles PATH" "PATH" "$(grep 'PATH' "$install_file")"
 
 echo ""
 
