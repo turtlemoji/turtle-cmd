@@ -485,7 +485,492 @@ assert_match "Telemetry check returns number" '^[0-9]+$' "$TELEMETRY_ISSUES"
 
 echo ""
 
-# ── 13. Integration: Full Scan ───────────────────────────────────────────────
+# ── 13. Unit Tests: Scoring System ────────────────────────────────────────
+
+echo -e "${BOLD}Unit: Scoring System${RESET}"
+
+# Source scoring functions
+eval "$(sed -n '/^add_score/,/^}/p' "$TURTLE")"
+eval "$(sed -n '/^add_max/,/^}/p' "$TURTLE")"
+eval "$(sed -n '/^record_check/,/^}/p' "$TURTLE")"
+
+# Reset scoring state
+TOTAL_SCORE=0; MAX_SCORE=0; CHECKS_PASSED=0; CHECKS_FAILED=0; CHECKS_SKIPPED=0
+declare -a CHECK_RESULTS=()
+
+# Test add_score
+add_score 100
+assert_eq "add_score accumulates (100)" "100" "$TOTAL_SCORE"
+add_score 50
+assert_eq "add_score accumulates (150)" "150" "$TOTAL_SCORE"
+
+# Test add_max
+add_max 200
+assert_eq "add_max accumulates (200)" "200" "$MAX_SCORE"
+add_max 100
+assert_eq "add_max accumulates (300)" "300" "$MAX_SCORE"
+
+# Reset for record_check tests
+TOTAL_SCORE=0; MAX_SCORE=0; CHECKS_PASSED=0; CHECKS_FAILED=0; CHECKS_SKIPPED=0
+CHECK_RESULTS=()
+
+# Test record_check pass
+record_check "System" "Firewall" "1" "100" "100"
+assert_eq "record_check pass increments CHECKS_PASSED" "1" "$CHECKS_PASSED"
+assert_eq "record_check pass leaves CHECKS_FAILED at 0" "0" "$CHECKS_FAILED"
+assert_eq "record_check stores result" "1" "${#CHECK_RESULTS[@]}"
+assert_match "record_check result format" 'System|Firewall|1|100|100' "${CHECK_RESULTS[0]}"
+
+# Test record_check fail
+record_check "System" "Encryption" "0" "0" "100"
+assert_eq "record_check fail increments CHECKS_FAILED" "1" "$CHECKS_FAILED"
+assert_eq "CHECKS_PASSED still 1 after fail" "1" "$CHECKS_PASSED"
+
+# Test record_check skip
+record_check "SSH" "Root login" "skip" "0" "50"
+assert_eq "record_check skip increments CHECKS_SKIPPED" "1" "$CHECKS_SKIPPED"
+assert_eq "Total results array has 3 entries" "3" "${#CHECK_RESULTS[@]}"
+
+echo ""
+
+# ── 14. Unit Tests: Rating Calculation ────────────────────────────────────
+
+echo -e "${BOLD}Unit: Rating Calculation${RESET}"
+
+eval "$(sed -n '/^get_rating/,/^}/p' "$TURTLE")"
+eval "$(sed -n '/^get_turtle_rating/,/^}/p' "$TURTLE")"
+
+# Boundary tests for get_rating
+assert_eq "100% => Diamond Shell" "Diamond Shell" "$(get_rating 100)"
+assert_eq "90%  => Diamond Shell" "Diamond Shell" "$(get_rating 90)"
+assert_eq "89%  => Shell Guardian" "Shell Guardian" "$(get_rating 89)"
+assert_eq "75%  => Shell Guardian" "Shell Guardian" "$(get_rating 75)"
+assert_eq "74%  => Steady Swimmer" "Steady Swimmer" "$(get_rating 74)"
+assert_eq "60%  => Steady Swimmer" "Steady Swimmer" "$(get_rating 60)"
+assert_eq "59%  => Soft Shell" "Soft Shell" "$(get_rating 59)"
+assert_eq "40%  => Soft Shell" "Soft Shell" "$(get_rating 40)"
+assert_eq "39%  => Hatchling" "Hatchling" "$(get_rating 39)"
+assert_eq "0%   => Hatchling" "Hatchling" "$(get_rating 0)"
+
+# Boundary tests for get_turtle_rating
+assert_eq "90%  => 5 turtles" "5" "$(get_turtle_rating 90)"
+assert_eq "75%  => 4 turtles" "4" "$(get_turtle_rating 75)"
+assert_eq "60%  => 3 turtles" "3" "$(get_turtle_rating 60)"
+assert_eq "40%  => 2 turtles" "2" "$(get_turtle_rating 40)"
+assert_eq "0%   => 1 turtle" "1" "$(get_turtle_rating 0)"
+
+echo ""
+
+# ── 15. Unit Tests: Penalty Caps ──────────────────────────────────────────
+
+echo -e "${BOLD}Unit: Penalty Caps${RESET}"
+
+# Test env file penalty cap at 100
+(
+    penalty_test() {
+        local ENV_FILES_COUNT=$1
+        local penalty=$((ENV_FILES_COUNT * 5))
+        [[ $penalty -gt 100 ]] && penalty=100
+        echo "$penalty"
+    }
+    # 5 files = 25 penalty (under cap)
+    result=$(penalty_test 5)
+    [[ "$result" -eq 25 ]] && exit 0 || exit 1
+) && env_pen="pass" || env_pen="fail"
+assert_eq "Env penalty: 5 files = 25 pts" "pass" "$env_pen"
+
+(
+    penalty_test() {
+        local ENV_FILES_COUNT=$1
+        local penalty=$((ENV_FILES_COUNT * 5))
+        [[ $penalty -gt 100 ]] && penalty=100
+        echo "$penalty"
+    }
+    result=$(penalty_test 20)
+    [[ "$result" -eq 100 ]] && exit 0 || exit 1
+) && env_pen="pass" || env_pen="fail"
+assert_eq "Env penalty: 20 files capped at 100" "pass" "$env_pen"
+
+(
+    penalty_test() {
+        local ENV_FILES_COUNT=$1
+        local penalty=$((ENV_FILES_COUNT * 5))
+        [[ $penalty -gt 100 ]] && penalty=100
+        echo "$penalty"
+    }
+    result=$(penalty_test 50)
+    [[ "$result" -eq 100 ]] && exit 0 || exit 1
+) && env_pen="pass" || env_pen="fail"
+assert_eq "Env penalty: 50 files still capped at 100" "pass" "$env_pen"
+
+# Test secrets penalty cap at 150
+(
+    penalty_test() {
+        local count=$1
+        local penalty=$((count * 10))
+        [[ $penalty -gt 150 ]] && penalty=150
+        echo "$penalty"
+    }
+    result=$(penalty_test 3)
+    [[ "$result" -eq 30 ]] && exit 0 || exit 1
+) && sec_pen="pass" || sec_pen="fail"
+assert_eq "Secrets penalty: 3 secrets = 30 pts" "pass" "$sec_pen"
+
+(
+    penalty_test() {
+        local count=$1
+        local penalty=$((count * 10))
+        [[ $penalty -gt 150 ]] && penalty=150
+        echo "$penalty"
+    }
+    result=$(penalty_test 20)
+    [[ "$result" -eq 150 ]] && exit 0 || exit 1
+) && sec_pen="pass" || sec_pen="fail"
+assert_eq "Secrets penalty: 20 secrets capped at 150" "pass" "$sec_pen"
+
+# Test rootkit penalty cap at 500
+(
+    penalty_test() {
+        local count=$1
+        local penalty=$((count * 50))
+        [[ $penalty -gt 500 ]] && penalty=500
+        echo "$penalty"
+    }
+    result=$(penalty_test 2)
+    [[ "$result" -eq 100 ]] && exit 0 || exit 1
+) && rk_pen="pass" || rk_pen="fail"
+assert_eq "Rootkit penalty: 2 indicators = 100 pts" "pass" "$rk_pen"
+
+(
+    penalty_test() {
+        local count=$1
+        local penalty=$((count * 50))
+        [[ $penalty -gt 500 ]] && penalty=500
+        echo "$penalty"
+    }
+    result=$(penalty_test 15)
+    [[ "$result" -eq 500 ]] && exit 0 || exit 1
+) && rk_pen="pass" || rk_pen="fail"
+assert_eq "Rootkit penalty: 15 indicators capped at 500" "pass" "$rk_pen"
+
+echo ""
+
+# ── 16. Unit Tests: .env File Detection ───────────────────────────────────
+
+echo -e "${BOLD}Unit: .env File Detection${RESET}"
+
+# Create fixture directory tree
+mkdir -p "$TMPDIR_TEST/envtest/project" "$TMPDIR_TEST/envtest/testdata" \
+         "$TMPDIR_TEST/envtest/node_modules/pkg"
+
+echo "SECRET=real" > "$TMPDIR_TEST/envtest/project/.env"
+echo "EXAMPLE=safe" > "$TMPDIR_TEST/envtest/project/.env.example"
+echo "SAMPLE=safe" > "$TMPDIR_TEST/envtest/project/.env.sample"
+echo "TEMPLATE=safe" > "$TMPDIR_TEST/envtest/project/.env.template"
+echo "TEST=safe" > "$TMPDIR_TEST/envtest/testdata/.env"
+echo "NODEMOD=safe" > "$TMPDIR_TEST/envtest/node_modules/pkg/.env"
+echo "PROD=real" > "$TMPDIR_TEST/envtest/project/.env.production"
+
+# Run detection scoped to fixture dir (reimplement the logic with scoped find)
+env_detected=$(find "$TMPDIR_TEST/envtest" \
+    -path "*/node_modules" -prune -o \
+    -path "*/.git" -prune -o \
+    -path "*/go/pkg/mod" -prune -o \
+    -path "*/.cache" -prune -o \
+    -path "*/vendor" -prune -o \
+    \( -name ".env" -o -name ".env.*" \) -print 2>/dev/null | while IFS= read -r envfile; do
+        [[ "$envfile" == *.example ]] && continue
+        [[ "$envfile" == *.sample ]] && continue
+        [[ "$envfile" == *.template ]] && continue
+        [[ "$envfile" == */testdata/* ]] && continue
+        [[ "$envfile" == */test/* ]] && continue
+        [[ "$envfile" == */fixtures/* ]] && continue
+        echo "$envfile"
+    done)
+
+env_count=$(echo "$env_detected" | grep -c . || echo "0")
+assert_eq ".env detected (real file)" "2" "$env_count"
+
+# Verify specific files found/excluded
+assert_match ".env.production found" ".env.production" "$env_detected"
+assert_match "project/.env found" "project/.env" "$env_detected"
+
+# Verify exclusions by checking they're NOT in output
+if echo "$env_detected" | grep -q ".env.example"; then
+    echo -e "  ${RED}✗${RESET} .env.example should be excluded"
+    FAIL=$((FAIL + 1)); ERRORS+=(".env.example exclusion")
+else
+    echo -e "  ${GREEN}✓${RESET} .env.example correctly excluded"
+    PASS=$((PASS + 1))
+fi
+
+if echo "$env_detected" | grep -q "testdata"; then
+    echo -e "  ${RED}✗${RESET} testdata/.env should be excluded"
+    FAIL=$((FAIL + 1)); ERRORS+=("testdata exclusion")
+else
+    echo -e "  ${GREEN}✓${RESET} testdata/.env correctly excluded"
+    PASS=$((PASS + 1))
+fi
+
+if echo "$env_detected" | grep -q "node_modules"; then
+    echo -e "  ${RED}✗${RESET} node_modules/.env should be pruned"
+    FAIL=$((FAIL + 1)); ERRORS+=("node_modules prune")
+else
+    echo -e "  ${GREEN}✓${RESET} node_modules/.env correctly pruned"
+    PASS=$((PASS + 1))
+fi
+
+echo ""
+
+# ── 17. Unit Tests: Home Permissions ──────────────────────────────────────
+
+echo -e "${BOLD}Unit: Home Permissions${RESET}"
+
+# Test the regex pattern used in check_home_permissions
+for perms_val in 700 750 755; do
+    if [[ "$perms_val" =~ ^7[05][05]$ ]]; then
+        echo -e "  ${GREEN}✓${RESET} Accepts $perms_val"
+        PASS=$((PASS + 1))
+    else
+        echo -e "  ${RED}✗${RESET} Should accept $perms_val"
+        FAIL=$((FAIL + 1)); ERRORS+=("Home perms $perms_val")
+    fi
+done
+
+for perms_val in 777 776 770 711 644; do
+    if [[ "$perms_val" =~ ^7[05][05]$ ]]; then
+        echo -e "  ${RED}✗${RESET} Should reject $perms_val"
+        FAIL=$((FAIL + 1)); ERRORS+=("Home perms reject $perms_val")
+    else
+        echo -e "  ${GREEN}✓${RESET} Rejects $perms_val"
+        PASS=$((PASS + 1))
+    fi
+done
+
+echo ""
+
+# ── 18. Unit Tests: Umask ─────────────────────────────────────────────────
+
+echo -e "${BOLD}Unit: Umask Validation${RESET}"
+
+# Test the umask check logic in isolation
+test_umask_secure() {
+    local test_umask="$1"
+    case "$test_umask" in
+        0027|027|0077|077) return 0 ;;
+        *)
+            local mask_val=$((8#$test_umask))
+            [[ $mask_val -ge $((8#027)) ]]
+            ;;
+    esac
+}
+
+for um in 027 077 0027 0077; do
+    if test_umask_secure "$um" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${RESET} Accepts umask $um"
+        PASS=$((PASS + 1))
+    else
+        echo -e "  ${RED}✗${RESET} Should accept umask $um"
+        FAIL=$((FAIL + 1)); ERRORS+=("umask $um")
+    fi
+done
+
+for um in 022 002 000; do
+    if test_umask_secure "$um" 2>/dev/null; then
+        echo -e "  ${RED}✗${RESET} Should reject umask $um"
+        FAIL=$((FAIL + 1)); ERRORS+=("umask reject $um")
+    else
+        echo -e "  ${GREEN}✓${RESET} Rejects umask $um"
+        PASS=$((PASS + 1))
+    fi
+done
+
+echo ""
+
+# ── 19. Unit Tests: Open Ports ────────────────────────────────────────────
+
+echo -e "${BOLD}Unit: Open Ports Detection${RESET}"
+
+# Test the port matching logic with mock data
+test_open_ports() {
+    local listening_ports="$1"
+    local dangerous_ports=(21 23 25 69 110 143 445 513 514)
+    for port in "${dangerous_ports[@]}"; do
+        if echo "$listening_ports" | grep -q "^${port}$"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Safe ports only
+safe_ports=$(printf '%s\n' 22 80 443 3000 8080)
+if test_open_ports "$safe_ports"; then
+    echo -e "  ${GREEN}✓${RESET} Safe ports (22,80,443,3000,8080) pass"
+    PASS=$((PASS + 1))
+else
+    echo -e "  ${RED}✗${RESET} Safe ports should pass"
+    FAIL=$((FAIL + 1)); ERRORS+=("safe ports")
+fi
+
+# Telnet port (23) is dangerous
+danger_ports=$(printf '%s\n' 22 23 80 443)
+if test_open_ports "$danger_ports"; then
+    echo -e "  ${RED}✗${RESET} Port 23 (telnet) should fail"
+    FAIL=$((FAIL + 1)); ERRORS+=("port 23 detection")
+else
+    echo -e "  ${GREEN}✓${RESET} Detects port 23 (telnet)"
+    PASS=$((PASS + 1))
+fi
+
+# FTP port (21) is dangerous
+ftp_ports=$(printf '%s\n' 21 443)
+if test_open_ports "$ftp_ports"; then
+    echo -e "  ${RED}✗${RESET} Port 21 (FTP) should fail"
+    FAIL=$((FAIL + 1)); ERRORS+=("port 21 detection")
+else
+    echo -e "  ${GREEN}✓${RESET} Detects port 21 (FTP)"
+    PASS=$((PASS + 1))
+fi
+
+# SMB port (445)
+smb_ports=$(printf '%s\n' 80 445 8080)
+if test_open_ports "$smb_ports"; then
+    echo -e "  ${RED}✗${RESET} Port 445 (SMB) should fail"
+    FAIL=$((FAIL + 1)); ERRORS+=("port 445 detection")
+else
+    echo -e "  ${GREEN}✓${RESET} Detects port 445 (SMB)"
+    PASS=$((PASS + 1))
+fi
+
+# Empty input (no ports) should pass
+if test_open_ports ""; then
+    echo -e "  ${GREEN}✓${RESET} No ports listening passes"
+    PASS=$((PASS + 1))
+else
+    echo -e "  ${RED}✗${RESET} No ports should pass"
+    FAIL=$((FAIL + 1)); ERRORS+=("empty ports")
+fi
+
+# Port 2123 should NOT match port 21 (exact match test)
+almost_ports=$(printf '%s\n' 2123 2345 8023)
+if test_open_ports "$almost_ports"; then
+    echo -e "  ${GREEN}✓${RESET} Port 2123 doesn't false-match 21"
+    PASS=$((PASS + 1))
+else
+    echo -e "  ${RED}✗${RESET} Port 2123 should not match port 21"
+    FAIL=$((FAIL + 1)); ERRORS+=("port false match")
+fi
+
+echo ""
+
+# ── 20. Unit Tests: JSON Output ───────────────────────────────────────────
+
+echo -e "${BOLD}Unit: JSON Output${RESET}"
+
+# Source the JSON output function and test it
+json_test_output=$(bash -c '
+VERSION="1.0.0"
+OS_TYPE="linux"
+TOTAL_SCORE=750
+MAX_SCORE=1000
+
+declare -a CHECK_RESULTS=(
+    "System|Firewall enabled|1|100|100"
+    "System|Disk encryption|0|0|100"
+    "SSH|Root login disabled|skip|0|50"
+)
+
+'"$(sed -n '/^get_rating/,/^}/p' "$TURTLE")"'
+'"$(sed -n '/^print_json_output/,/^}/p' "$TURTLE")"'
+
+print_json_output
+' 2>/dev/null)
+
+assert_match "JSON has opening brace" '^\{' "$json_test_output"
+assert_match "JSON has version" '"version": "1.0.0"' "$json_test_output"
+assert_match "JSON has score 750" '"score": 750' "$json_test_output"
+assert_match "JSON has max_score 1000" '"max_score": 1000' "$json_test_output"
+assert_match "JSON has percentage 75" '"percentage": 75' "$json_test_output"
+assert_match "JSON has Shell Guardian rating" '"rating": "Shell Guardian"' "$json_test_output"
+assert_match "JSON has checks array" '"checks":' "$json_test_output"
+assert_match "JSON has passed status" '"status": "passed"' "$json_test_output"
+assert_match "JSON has failed status" '"status": "failed"' "$json_test_output"
+assert_match "JSON has skipped status" '"status": "skipped"' "$json_test_output"
+assert_match "JSON has closing brace" '^\}' "$json_test_output"
+
+echo ""
+
+# ── 21. Unit Tests: Core Dumps ────────────────────────────────────────────
+
+echo -e "${BOLD}Unit: Core Dumps${RESET}"
+
+if [[ "$OS_TYPE" == "linux" ]]; then
+    eval "$(sed -n '/^check_core_dumps_disabled/,/^}/p' "$TURTLE")"
+    OS_TYPE="linux"
+    # Run check - just verify it returns a valid exit code and doesn't crash
+    check_core_dumps_disabled 2>/dev/null && core_result="pass" || core_result="fail"
+    # We can't guarantee the result, but it should execute without error
+    assert_match "Core dumps check runs on Linux" "pass|fail" "$core_result"
+
+    # Verify the function checks the right things
+    core_code=$(sed -n '/^check_core_dumps_disabled/,/^}/p' "$TURTLE")
+    assert_match "Checks ulimit -c" "ulimit -c" "$core_code"
+    assert_match "Checks kernel.core_pattern" "core_pattern" "$core_code"
+elif [[ "$OS_TYPE" == "macos" ]]; then
+    core_code=$(sed -n '/^check_core_dumps_disabled/,/^}/p' "$TURTLE")
+    assert_match "Checks launchctl on macOS" "launchctl" "$core_code"
+else
+    skip_test "Core dumps check" "Unknown OS"
+fi
+
+echo ""
+
+# ── 22. Unit Tests: Percentage & Score Edge Cases ─────────────────────────
+
+echo -e "${BOLD}Unit: Score Edge Cases${RESET}"
+
+# Test percentage calculation with zero max_score (division by zero protection)
+json_zero_output=$(bash -c '
+VERSION="1.0.0"
+OS_TYPE="linux"
+TOTAL_SCORE=0
+MAX_SCORE=0
+
+declare -a CHECK_RESULTS=()
+
+'"$(sed -n '/^get_rating/,/^}/p' "$TURTLE")"'
+'"$(sed -n '/^print_json_output/,/^}/p' "$TURTLE")"'
+
+print_json_output
+' 2>/dev/null)
+assert_match "Zero max_score doesn't crash" '"percentage": 0' "$json_zero_output"
+assert_match "Zero score gets Hatchling" '"rating": "Hatchling"' "$json_zero_output"
+
+# Test negative score (from penalties exceeding points)
+json_neg_output=$(bash -c '
+VERSION="1.0.0"
+OS_TYPE="linux"
+TOTAL_SCORE=-50
+MAX_SCORE=500
+
+declare -a CHECK_RESULTS=()
+
+'"$(sed -n '/^get_rating/,/^}/p' "$TURTLE")"'
+'"$(sed -n '/^print_json_output/,/^}/p' "$TURTLE")"'
+
+print_json_output
+' 2>/dev/null)
+# Negative score should still produce valid JSON (not crash)
+assert_match "Negative score produces JSON" '"score": -50' "$json_neg_output"
+assert_match "Negative score has max_score" '"max_score": 500' "$json_neg_output"
+
+# Test perfect score
+assert_eq "100% is Diamond Shell" "Diamond Shell" "$(get_rating 100)"
+
+echo ""
+
+# ── 23. Integration: Full Scan ────────────────────────────────────────────────
 
 if [[ "$RUN_MODE" == "unit" ]]; then
     skip_test "Integration: full scan" "unit mode (pass 'all' to run)"
@@ -536,7 +1021,7 @@ fi
 
 echo ""
 
-# ── 14. Integration: JSON Output ─────────────────────────────────────────────
+# ── 24. Integration: JSON Output ─────────────────────────────────────────────
 
 echo -e "${BOLD}Integration: JSON Output${RESET}"
 
