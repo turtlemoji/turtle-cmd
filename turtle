@@ -46,7 +46,8 @@ detect_os() {
         if command -v gtimeout &>/dev/null; then
             timeout() { gtimeout "$@"; }
         else
-            timeout() { shift; "$@"; }
+            # Use perl's alarm() as timeout - perl is always on macOS
+            timeout() { command perl -e 'alarm shift; exec @ARGV' "$@"; }
         fi
     fi
 }

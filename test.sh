@@ -95,7 +95,7 @@ if ! command -v timeout &>/dev/null; then
     if command -v gtimeout &>/dev/null; then
         timeout() { gtimeout "$@"; }
     else
-        timeout() { shift; "$@"; }  # just run without timeout
+        timeout() { command perl -e 'alarm shift; exec @ARGV' "$@"; }
     fi
 fi
 
