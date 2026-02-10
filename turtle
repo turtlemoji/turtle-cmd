@@ -40,6 +40,15 @@ detect_os() {
         Darwin) OS_TYPE="macos" ;;
         *)      OS_TYPE="unknown" ;;
     esac
+
+    # macOS doesn't have timeout (GNU coreutils)
+    if ! command -v timeout &>/dev/null; then
+        if command -v gtimeout &>/dev/null; then
+            timeout() { gtimeout "$@"; }
+        else
+            timeout() { shift; "$@"; }
+        fi
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

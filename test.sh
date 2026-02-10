@@ -90,6 +90,15 @@ skip_test() {
 OS="$(uname -s)"
 case "$OS" in Linux) OS_TYPE="linux";; Darwin) OS_TYPE="macos";; *) OS_TYPE="unknown";; esac
 
+# macOS doesn't have timeout (GNU coreutils), use gtimeout or skip
+if ! command -v timeout &>/dev/null; then
+    if command -v gtimeout &>/dev/null; then
+        timeout() { gtimeout "$@"; }
+    else
+        timeout() { shift; "$@"; }  # just run without timeout
+    fi
+fi
+
 # Temp dir for test fixtures
 TMPDIR_TEST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
