@@ -485,7 +485,61 @@ assert_match "Telemetry check returns number" '^[0-9]+$' "$TELEMETRY_ISSUES"
 
 echo ""
 
-# ── 13. Unit Tests: Scoring System ────────────────────────────────────────
+# ── 13. Unit Tests: HIBP Email Collection ─────────────────────────────────
+
+echo -e "${BOLD}Unit: HIBP Email Collection${RESET}"
+
+# Verify check_hibp function collects emails from multiple sources
+hibp_code=$(sed -n '/^check_hibp/,/^}/p' "$TURTLE")
+assert_match "HIBP checks git global email" "git config --global user.email" "$hibp_code"
+assert_match "HIBP checks SSH key comments" "\.ssh/\*\.pub" "$hibp_code"
+assert_match "HIBP checks repo git configs" "\.git/config" "$hibp_code"
+assert_match "HIBP deduplicates emails" "_add_email" "$hibp_code"
+assert_match "HIBP uses XposedOrNot API" "xposedornot" "$hibp_code"
+
+# Test email extraction from SSH pubkeys with mock fixture
+mkdir -p "$TMPDIR_TEST/hibp_ssh"
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@example.com" > "$TMPDIR_TEST/hibp_ssh/id_ed25519.pub"
+echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB... nocomment" > "$TMPDIR_TEST/hibp_ssh/id_rsa.pub"
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... dev@company.org" > "$TMPDIR_TEST/hibp_ssh/work.pub"
+
+# Extract emails from pubkeys the same way check_hibp does
+pubkey_emails=""
+for pubkey in "$TMPDIR_TEST/hibp_ssh"/*.pub; do
+    comment=$(awk '{print $NF}' "$pubkey" 2>/dev/null || echo "")
+    if [[ "$comment" == *@*.* ]]; then
+        pubkey_emails="${pubkey_emails}${comment} "
+    fi
+done
+assert_match "Extracts email from ed25519 key" "user@example.com" "$pubkey_emails"
+assert_match "Extracts email from work key" "dev@company.org" "$pubkey_emails"
+# "nocomment" doesn't match *@*.* pattern
+if echo "$pubkey_emails" | grep -q "nocomment"; then
+    echo -e "  ${RED}✗${RESET} Should skip non-email comment"
+    FAIL=$((FAIL + 1)); ERRORS+=("pubkey non-email")
+else
+    echo -e "  ${GREEN}✓${RESET} Skips non-email SSH key comment"
+    PASS=$((PASS + 1))
+fi
+
+echo ""
+
+# ── 14. Unit Tests: Session Tokens (WhatsApp/GitHub) ─────────────────────
+
+echo -e "${BOLD}Unit: Session Tokens Coverage${RESET}"
+
+session_code=$(sed -n '/^check_session_tokens/,/^}/p' "$TURTLE")
+assert_match "Checks Discord sessions" "discord" "$session_code"
+assert_match "Checks Slack sessions" "Slack" "$session_code"
+assert_match "Checks Telegram sessions" "Telegram" "$session_code"
+assert_match "Checks WhatsApp sessions" "WhatsApp" "$session_code"
+assert_match "Checks GitHub Desktop sessions" "GitHub Desktop" "$session_code"
+assert_match "Checks Linux paths" ".config" "$session_code"
+assert_match "Checks macOS paths" "Application Support" "$session_code"
+
+echo ""
+
+# ── 15. Unit Tests: Scoring System ────────────────────────────────────────
 
 echo -e "${BOLD}Unit: Scoring System${RESET}"
 
@@ -533,7 +587,7 @@ assert_eq "Total results array has 3 entries" "3" "${#CHECK_RESULTS[@]}"
 
 echo ""
 
-# ── 14. Unit Tests: Rating Calculation ────────────────────────────────────
+# ── 16. Unit Tests: Rating Calculation ────────────────────────────────────
 
 echo -e "${BOLD}Unit: Rating Calculation${RESET}"
 
@@ -561,7 +615,7 @@ assert_eq "0%   => 1 turtle" "1" "$(get_turtle_rating 0)"
 
 echo ""
 
-# ── 15. Unit Tests: Penalty Caps ──────────────────────────────────────────
+# ── 17. Unit Tests: Penalty Caps ──────────────────────────────────────────
 
 echo -e "${BOLD}Unit: Penalty Caps${RESET}"
 
@@ -655,7 +709,7 @@ assert_eq "Rootkit penalty: 15 indicators capped at 500" "pass" "$rk_pen"
 
 echo ""
 
-# ── 16. Unit Tests: .env File Detection ───────────────────────────────────
+# ── 18. Unit Tests: .env File Detection ───────────────────────────────────
 
 echo -e "${BOLD}Unit: .env File Detection${RESET}"
 
@@ -722,7 +776,7 @@ fi
 
 echo ""
 
-# ── 17. Unit Tests: Home Permissions ──────────────────────────────────────
+# ── 19. Unit Tests: Home Permissions ──────────────────────────────────────
 
 echo -e "${BOLD}Unit: Home Permissions${RESET}"
 
@@ -749,7 +803,7 @@ done
 
 echo ""
 
-# ── 18. Unit Tests: Umask ─────────────────────────────────────────────────
+# ── 20. Unit Tests: Umask ─────────────────────────────────────────────────
 
 echo -e "${BOLD}Unit: Umask Validation${RESET}"
 
@@ -787,7 +841,7 @@ done
 
 echo ""
 
-# ── 19. Unit Tests: Open Ports ────────────────────────────────────────────
+# ── 21. Unit Tests: Open Ports ────────────────────────────────────────────
 
 echo -e "${BOLD}Unit: Open Ports Detection${RESET}"
 
@@ -864,7 +918,7 @@ fi
 
 echo ""
 
-# ── 20. Unit Tests: JSON Output ───────────────────────────────────────────
+# ── 22. Unit Tests: JSON Output ───────────────────────────────────────────
 
 echo -e "${BOLD}Unit: JSON Output${RESET}"
 
@@ -901,7 +955,7 @@ assert_match "JSON has closing brace" '^\}' "$json_test_output"
 
 echo ""
 
-# ── 21. Unit Tests: Core Dumps ────────────────────────────────────────────
+# ── 23. Unit Tests: Core Dumps ────────────────────────────────────────────
 
 echo -e "${BOLD}Unit: Core Dumps${RESET}"
 
@@ -926,7 +980,7 @@ fi
 
 echo ""
 
-# ── 22. Unit Tests: Percentage & Score Edge Cases ─────────────────────────
+# ── 24. Unit Tests: Percentage & Score Edge Cases ─────────────────────────
 
 echo -e "${BOLD}Unit: Score Edge Cases${RESET}"
 
@@ -970,7 +1024,7 @@ assert_eq "100% is Diamond Shell" "Diamond Shell" "$(get_rating 100)"
 
 echo ""
 
-# ── 23. Integration: Full Scan ────────────────────────────────────────────────
+# ── 25. Integration: Full Scan ────────────────────────────────────────────
 
 if [[ "$RUN_MODE" == "unit" ]]; then
     skip_test "Integration: full scan" "unit mode (pass 'all' to run)"
@@ -1021,7 +1075,7 @@ fi
 
 echo ""
 
-# ── 24. Integration: JSON Output ─────────────────────────────────────────────
+# ── 26. Integration: JSON Output ─────────────────────────────────────────────
 
 echo -e "${BOLD}Integration: JSON Output${RESET}"
 

@@ -1436,6 +1436,30 @@ check_session_tokens() {
         fi
     done
 
+    # WhatsApp session
+    local whatsapp_paths=(
+        "$HOME/.config/WhatsApp/Local Storage/leveldb"
+        "$HOME/Library/Application Support/WhatsApp/Local Storage/leveldb"
+    )
+    for wpath in "${whatsapp_paths[@]}"; do
+        if [[ -d "$wpath" ]]; then
+            SESSION_TOKENS_FOUND=$((SESSION_TOKENS_FOUND + 1))
+            SESSION_TOKENS_LIST+=("WhatsApp session: $wpath")
+        fi
+    done
+
+    # GitHub Desktop session
+    local github_paths=(
+        "$HOME/.config/GitHub Desktop/Cookies"
+        "$HOME/Library/Application Support/GitHub Desktop/Cookies"
+    )
+    for gpath in "${github_paths[@]}"; do
+        if [[ -f "$gpath" ]]; then
+            SESSION_TOKENS_FOUND=$((SESSION_TOKENS_FOUND + 1))
+            SESSION_TOKENS_LIST+=("GitHub Desktop session: $gpath")
+        fi
+    done
+
     # Informational - these are common stealer targets
     [[ "$SESSION_TOKENS_FOUND" -eq 0 ]]
 }
@@ -2424,46 +2448,82 @@ check_arp_protection() {
 HIBP_BREACHES=0
 HIBP_EMAIL=""
 HIBP_RESULT=""
+declare -a HIBP_EMAILS_CHECKED=()
+declare -a HIBP_BREACH_DETAILS=()
 
 check_hibp() {
     HIBP_BREACHES=0
     HIBP_EMAIL=""
     HIBP_RESULT=""
+    HIBP_EMAILS_CHECKED=()
+    HIBP_BREACH_DETAILS=()
 
-    # Find email from git config
-    HIBP_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
-    [[ -z "$HIBP_EMAIL" ]] && return 0
+    # Collect unique emails from multiple sources
+    local seen="" emails=()
 
-    # Use the free Mozilla Monitor / HIBP password API (k-anonymity, no key needed)
-    # For breach check, we try multiple free endpoints
-    local response http_code
+    _add_email() {
+        local e="$1"
+        [[ -z "$e" ]] && return
+        # Dedup: check if already seen (space-separated list)
+        case " $seen " in *" $e "*) return ;; esac
+        emails+=("$e")
+        seen="$seen $e"
+    }
 
-    # Try XposedOrNot free API (no key needed, returns breach count)
-    http_code=$(timeout 8 curl -s -o /tmp/.turtle_hibp_resp -w "%{http_code}" \
-        "https://api.xposedornot.com/v1/check-email/${HIBP_EMAIL}" 2>/dev/null || echo "000")
+    # 1. Git global config
+    _add_email "$(git config --global user.email 2>/dev/null || echo "")"
 
-    if [[ "$http_code" == "200" ]]; then
-        response=$(cat /tmp/.turtle_hibp_resp 2>/dev/null || echo "")
-        rm -f /tmp/.turtle_hibp_resp
-        if echo "$response" | grep -q '"breaches"' 2>/dev/null; then
-            # Count breach names in the response (comma-separated in JSON array)
-            HIBP_BREACHES=$(echo "$response" | grep -o '"[^"]*"' | grep -v -E '"(breaches|Error)"' | wc -l | tr -d ' ')
-            HIBP_BREACHES=${HIBP_BREACHES:-0}
-            if [[ "$HIBP_BREACHES" -gt 0 ]]; then
-                HIBP_RESULT="found in $HIBP_BREACHES breach(es)"
-            else
-                HIBP_RESULT="no breaches found"
+    # 2. SSH public key comments (often contain emails)
+    for pubkey in "$HOME"/.ssh/*.pub; do
+        [[ -f "$pubkey" ]] || continue
+        local comment
+        comment=$(awk '{print $NF}' "$pubkey" 2>/dev/null || echo "")
+        [[ "$comment" == *@*.* ]] && _add_email "$comment"
+    done
+
+    # 3. Git repo-level emails (check a few recent repos)
+    while IFS= read -r gitconfig; do
+        _add_email "$(git config -f "$gitconfig" user.email 2>/dev/null || echo "")"
+    done < <(find "$HOME" -maxdepth 4 -path "*/.git/config" -not -path "*/node_modules/*" 2>/dev/null | head -5)
+
+    [[ ${#emails[@]} -eq 0 ]] && return 0
+
+    # Set primary email for display
+    HIBP_EMAIL="${emails[0]}"
+
+    # Check each email against XposedOrNot free API
+    local total_breaches=0
+    for email in "${emails[@]}"; do
+        HIBP_EMAILS_CHECKED+=("$email")
+        local response http_code
+        http_code=$(timeout 8 curl -s -o /tmp/.turtle_hibp_resp -w "%{http_code}" \
+            "https://api.xposedornot.com/v1/check-email/${email}" 2>/dev/null || echo "000")
+
+        if [[ "$http_code" == "200" ]]; then
+            response=$(cat /tmp/.turtle_hibp_resp 2>/dev/null || echo "")
+            rm -f /tmp/.turtle_hibp_resp
+            if echo "$response" | grep -q '"breaches"' 2>/dev/null; then
+                local count
+                count=$(echo "$response" | grep -o '"[^"]*"' | grep -v -E '"(breaches|Error)"' | wc -l | tr -d ' ')
+                count=${count:-0}
+                if [[ "$count" -gt 0 ]]; then
+                    total_breaches=$((total_breaches + count))
+                    HIBP_BREACH_DETAILS+=("$email: $count breach(es)")
+                fi
             fi
+        elif [[ "$http_code" != "404" ]]; then
+            rm -f /tmp/.turtle_hibp_resp
+            HIBP_BREACH_DETAILS+=("$email: check manually at haveibeenpwned.com")
         else
-            HIBP_RESULT="no breaches found"
+            rm -f /tmp/.turtle_hibp_resp
         fi
-    elif [[ "$http_code" == "404" ]]; then
-        rm -f /tmp/.turtle_hibp_resp
-        HIBP_RESULT="no breaches found"
+    done
+
+    HIBP_BREACHES=$total_breaches
+    if [[ "$total_breaches" -gt 0 ]]; then
+        HIBP_RESULT="found in $total_breaches breach(es) across ${#HIBP_BREACH_DETAILS[@]} email(s)"
     else
-        rm -f /tmp/.turtle_hibp_resp
-        # Fallback: just report the email and suggest manual check
-        HIBP_RESULT="check manually at haveibeenpwned.com"
+        HIBP_RESULT="no breaches found (${#emails[@]} email(s) checked)"
     fi
 
     [[ "$HIBP_BREACHES" -eq 0 ]]
@@ -2610,13 +2670,14 @@ run_advanced_checks() {
     # Have I Been Pwned
     animate_turtle "Checking breach databases"
     check_hibp || true
-    if [[ -n "$HIBP_EMAIL" ]]; then
-        if [[ "$HIBP_BREACHES" -eq 0 ]] && [[ "$HIBP_RESULT" == "no breaches found" ]]; then
-            record_check "$category" "Email not in breaches ($HIBP_EMAIL)" "1" "0" "0"
-        elif [[ "$HIBP_BREACHES" -gt 0 ]]; then
-            record_check "$category" "!! Email in $HIBP_BREACHES breach(es) ($HIBP_EMAIL)" "0" "0" "0"
+    if [[ ${#HIBP_EMAILS_CHECKED[@]} -gt 0 ]]; then
+        local email_list
+        email_list=$(printf "%s, " "${HIBP_EMAILS_CHECKED[@]}")
+        email_list="${email_list%, }"
+        if [[ "$HIBP_BREACHES" -eq 0 ]]; then
+            record_check "$category" "No breaches found ($email_list)" "1" "0" "0"
         else
-            record_check "$category" "Breach check: $HIBP_RESULT" "skip" "0" "0"
+            record_check "$category" "!! $HIBP_BREACHES breach(es) found ($email_list)" "0" "0" "0"
         fi
     fi
 
@@ -2983,8 +3044,10 @@ print_findings() {
     if [[ "$HIBP_BREACHES" -gt 0 ]]; then
         has_findings=true
         echo ""
-        echo -e "${RED}${BOLD}Email breach alert ($HIBP_EMAIL):${RESET}"
-        echo -e "  ${DIM}→${RESET} Found in $HIBP_BREACHES known data breach(es)"
+        echo -e "${RED}${BOLD}Email breach alert:${RESET}"
+        for detail in "${HIBP_BREACH_DETAILS[@]}"; do
+            echo -e "  ${DIM}→${RESET} $detail"
+        done
         echo -e "  ${YELLOW}Check https://haveibeenpwned.com for details. Change reused passwords${RESET}"
     fi
 
