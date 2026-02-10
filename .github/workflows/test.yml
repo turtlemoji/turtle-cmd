@@ -35,3 +35,34 @@ jobs:
       - name: Full scan test
         run: bash test.sh integration
         timeout-minutes: 3
+
+  install:
+    name: Install (${{ matrix.os }})
+    needs: unit
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test curl install
+        run: |
+          # Serve repo files over HTTP locally
+          python3 -m http.server 8888 &
+          SERVER_PID=$!
+          sleep 1
+
+          # Override REPO to point at local server, install to temp dir
+          DEST="$RUNNER_TEMP/turtle-test/turtle"
+          sed "s|https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle|http://localhost:8888/turtle|" install.sh \
+            | bash -s -- "$DEST"
+
+          # Verify it installed and works
+          test -x "$DEST"
+          "$DEST" --help | grep -q "Usage"
+          "$DEST" --quiet 2>&1 | grep -q "YOUR SCORE"
+
+          kill $SERVER_PID
+          echo "curl install test passed"
+        timeout-minutes: 3
