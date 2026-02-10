@@ -179,8 +179,8 @@ echo -e "${BOLD}Animation${RESET}"
 frame_count=$(grep -c '^TURTLE_FRAME_[0-9]*=' "$TURTLE" || echo "0")
 assert_eq "Has 10 animation frames" "10" "$frame_count"
 
-spinner_count=$(grep 'SPINNER_FRAMES=' "$TURTLE" | grep -oE '"[^"]*"' | wc -l || echo "0")
-assert_match "Has 10 spinner frames" "^10$" "$spinner_count"
+spinner_count=$(grep 'SPINNER_FRAMES=' "$TURTLE" | grep -oE '"[^"]*"' | wc -l | tr -d ' ' || echo "0")
+assert_eq "Has 10 spinner frames" "10" "$spinner_count"
 
 init_fn_count=$(sed -n '/^init_turtle_frames/,/^}/p' "$TURTLE" | grep -c 'TURTLE_FRAMES_BIG\[')
 assert_eq "init_turtle_frames loads 10 frames" "10" "$init_fn_count"
@@ -468,7 +468,7 @@ check_session_tokens 2>/dev/null || true
 assert_match "Session tokens check returns number" '^[0-9]+$' "$SESSION_TOKENS_FOUND"
 
 # Telemetry - verify it runs
-eval "$(sed -n '/^check_telemetry/,/^[a-z]/p' "$TURTLE" | head -n -1)"
+eval "$(sed -n '/^check_telemetry/,/^}/p' "$TURTLE")"
 TELEMETRY_ISSUES=0
 declare -a TELEMETRY_LIST=()
 check_telemetry 2>/dev/null || true
