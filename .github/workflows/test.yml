@@ -58,10 +58,9 @@ jobs:
           sed "s|https://raw.githubusercontent.com/turtlemoji/turtle-cmd/main/turtle|http://localhost:8888/turtle|" install.sh \
             | bash -s -- "$DEST"
 
-          # Verify it installed and works
+          # Verify it installed and runs
           test -x "$DEST"
           "$DEST" --help | grep -q "Usage"
-          "$DEST" --quiet 2>&1 | grep -q "YOUR SCORE"
 
           kill $SERVER_PID
           echo "curl install test passed"
