@@ -44,6 +44,8 @@ main() {
 
     echo "HI"
 
+    sleep 5
+
 }
 
 # Cleanup on exit
