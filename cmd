@@ -48,11 +48,11 @@ main() {
 
 }
 
-# # Cleanup on exit
-# cleanup() {
-#     tput cnorm 2>/dev/null || true
-# }
-# trap cleanup EXIT
+# Cleanup on exit
+cleanup() {
+    tput cnorm 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # Run main
 main "$@"
